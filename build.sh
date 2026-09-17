@@ -15,6 +15,8 @@ cp FlyGift "$CONTENTS/MacOS/FlyGift"
 cp app/Info.plist "$CONTENTS/Info.plist"
 cp LIF.metal "$CONTENTS/Resources/LIF.metal"
 cp LICENSE "$CONTENTS/Resources/LICENSE.txt"
+cp assets/fly-realistic-v2.png "$CONTENTS/Resources/fly-realistic-v2.png"
+cp assets/swatter-red-v3.png "$CONTENTS/Resources/swatter-red-v3.png"
 cp -R data "$CONTENTS/Resources/data"
 
 rm -f build/FlyGift-macOS-arm64.zip build/SHA256SUMS.txt

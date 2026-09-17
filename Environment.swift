@@ -13,9 +13,17 @@ struct Ledge {
     let id: Int
 }
 
+// The visible rectangle of a normal app window, in scene coordinates. The fly
+// can crawl just behind the title bar so the real desktop window occludes it.
+struct WindowRegion {
+    let rect: CGRect
+    let id: Int
+}
+
 final class WindowSense {
     struct Snapshot {
         let ledges: [Ledge]
+        let windows: [WindowRegion]
         let newWindows: [(center: CGPoint, size: CGFloat)]
     }
 
@@ -26,13 +34,14 @@ final class WindowSense {
     func poll(screen: NSRect) -> Snapshot {
         guard let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
                                                     kCGNullWindowID) as? [[String: Any]] else {
-            return Snapshot(ledges: [], newWindows: [])
+            return Snapshot(ledges: [], windows: [], newWindows: [])
         }
         // CG global coords are top-left-of-primary; Cocoa are bottom-left-of-primary.
         let primaryH = NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.height
             ?? screen.height
         let W = screen.width, H = screen.height
         var ledges: [Ledge] = []
+        var windows: [WindowRegion] = []
         var newWins: [(CGPoint, CGFloat)] = []
         var ids = Set<Int>()
         for w in info {
@@ -50,10 +59,15 @@ final class WindowSense {
             guard cocoaRect.intersects(screen) else { continue }
             // scene coords: centered on this display, y up
             let topY = (primaryH - rect.minY) - screen.midY
+            let bottomY = (primaryH - rect.maxY) - screen.midY
             let x0 = max(rect.minX - screen.midX, -W / 2 + 15)
             let x1 = min(rect.maxX - screen.midX, W / 2 - 15)
             if topY < H / 2 - 8, topY > -H / 2 + 8, x1 - x0 > 100, ledges.count < 12 {
                 ledges.append(Ledge(y: topY, x0: x0, x1: x1, id: num))
+                windows.append(WindowRegion(rect: CGRect(x: x0, y: bottomY,
+                                                          width: x1 - x0,
+                                                          height: max(0, topY - bottomY)),
+                                                  id: num))
             }
             if !first && !knownIDs.contains(num) {
                 let center = CGPoint(x: rect.midX - screen.midX,
@@ -63,7 +77,7 @@ final class WindowSense {
         }
         knownIDs = ids
         first = false
-        return Snapshot(ledges: ledges, newWindows: newWins)
+        return Snapshot(ledges: ledges, windows: windows, newWindows: newWins)
     }
 }
 

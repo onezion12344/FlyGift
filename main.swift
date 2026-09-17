@@ -433,6 +433,35 @@ func runBehaviorTest() {
         return (false, "state=\(fly.state)")
     }
 
+    bodyCheck("window hiding occludes fly; GF escape still wins") {
+        let fly = Fly(at: CGPoint(x: 0, y: -40))
+        let ledge = Ledge(y: -40, x0: -300, x1: 300, id: 7)
+        let region = WindowRegion(rect: CGRect(x: -300, y: -320, width: 600, height: 280), id: 7)
+        fly.state = .idle; fly.terrain = [ledge]; fly.windows = [region]; fly.ledge = ledge
+        fly.startHiding(in: region, hold: 0.5)
+        var quiet = BrainSignals()
+        for _ in 0..<22 { fly.update(dt: dt, bounds: bounds, mouse: nil, signals: quiet) }
+        guard fly.isHiding && fly.node.opacity < 0.2 else {
+            return (false, "did not disappear behind window")
+        }
+        quiet.escape = true
+        fly.update(dt: dt, bounds: bounds, mouse: nil, signals: quiet)
+        return (fly.state == .flying && !fly.isHiding && fly.node.opacity > 0.9,
+                "state=\(fly.state), hidden=\(fly.isHiding)")
+    }
+
+    bodyCheck("jumpscare flight rushes camera then returns") {
+        let fly = Fly(at: CGPoint(x: -480, y: -220))
+        fly.startJumpscare(bounds: bounds)
+        var peakScale: CGFloat = 0
+        for _ in 0..<95 {
+            fly.update(dt: dt, bounds: bounds, mouse: nil, signals: BrainSignals())
+            peakScale = max(peakScale, CGFloat(fly.node.scale.x))
+        }
+        return (!fly.isJumpscaring && fly.state != .flying && peakScale > 6,
+                String(format: "peak scale %.1f, state %@", peakScale, "\(fly.state)"))
+    }
+
     bodyCheck("sleep signal -> sleeping; wake -> grooming") {
         let fly = Fly(at: .zero)
         fly.state = .idle
@@ -602,6 +631,7 @@ struct FlySnapshot {
     let flying: Bool
     let visible: Bool
     let radius: CGFloat
+    let jumpscaring: Bool
 }
 
 final class Coordinator: NSObject, SCNSceneRendererDelegate {
@@ -625,6 +655,7 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
 
     // environment senses (written from main-thread timers, read in render loop)
     private var terrain: [Ledge] = []
+    private var windowRegions: [WindowRegion] = []
     private var typingLevel: CGFloat = 0
     private var sleepy = false
     private var tempo: CGFloat = 1
@@ -635,12 +666,15 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
     private var lastFlyGrounded = false
     private var lastFlyVisible = false
     private var lastFlyRadius: CGFloat = 22
+    private var lastFlyJumpscaring = false
     private var challengeActive = false
     private var challengeElapsed: CGFloat = 0
     private var flightContinuous: CGFloat = 0
     private var groundedContinuous: CGFloat = 0
     private var groundedOpportunities = 0
     private var countedCurrentGround = false
+    private var jumpscareAt: CGFloat = 46
+    private var didJumpscare = false
 
     init(bounds: CGSize, sim: MetalSim?, spawnInitially: Bool = true) {
         self.bounds = bounds
@@ -674,6 +708,8 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
             c.groundedContinuous = 0
             c.groundedOpportunities = 0
             c.countedCurrentGround = false
+            c.jumpscareAt = rnd(42...50)
+            c.didJumpscare = false
         }
     }
     func stopChallenge() { enqueue { $0.challengeActive = false } }
@@ -703,13 +739,16 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
     func escapeTest() { enqueue { $0.loomOverride = 0.6 } }
     func setMouse(_ p: CGPoint?) { lock.lock(); mouseScene = p; lock.unlock() }
 
-    func setTerrain(_ ledges: [Ledge]) { enqueue { $0.terrain = ledges } }
+    func setTerrain(_ ledges: [Ledge], windows: [WindowRegion] = []) {
+        enqueue { c in c.terrain = ledges; c.windowRegions = windows }
+    }
 
     // the fly moved to a different display: new bounds + camera extent
     func retarget(size: CGSize) {
         enqueue { c in
             c.bounds = size
             c.terrain = []   // stale until the next window poll
+            c.windowRegions = []
             if let camNode = c.scene.rootNode.childNode(withName: "camera", recursively: false) {
                 camNode.camera?.orthographicScale = Double(size.height / 2)
             }
@@ -732,7 +771,8 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
         guard lastFlyVisible else { return nil }
         return FlySnapshot(position: lastFlyPos, grounded: lastFlyGrounded,
                            flying: !lastFlyGrounded, visible: lastFlyVisible,
-                           radius: lastFlyRadius)
+                           radius: lastFlyRadius,
+                           jumpscaring: lastFlyJumpscaring)
     }
 
     // a window appeared near the fly: a real looming object
@@ -840,16 +880,28 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
 
         for (i, fly) in flies.enumerated() {
             fly.terrain = terrain
+            fly.windows = windowRegions
             fly.update(dt: dt, bounds: bounds, mouse: mouse, signals: i == 0 ? signals : nil)
         }
         if let first = flies.first {
             if challengeActive {
                 challengeElapsed += dt
+                if !didJumpscare, challengeElapsed >= jumpscareAt {
+                    first.startJumpscare(bounds: bounds)
+                    didJumpscare = true
+                }
+                first.hidingAllowed = challengeElapsed > 8 && groundedOpportunities >= 1
                 if first.state == .flying {
                     flightContinuous += dt
                     groundedContinuous = 0
                     countedCurrentGround = false
                     if flightContinuous > 12 { first.forceLandingSoon() }
+                } else if first.isHiding {
+                    flightContinuous = 0
+                    groundedContinuous = 0
+                    countedCurrentGround = false
+                    let target = challengeElapsed >= 44 ? 3 : (challengeElapsed >= 26 ? 2 : 1)
+                    if groundedOpportunities < target { first.finishHidingSoon() }
                 } else {
                     flightContinuous = 0
                     groundedContinuous += dt
@@ -867,9 +919,10 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
             }
             lock.lock()
             lastFlyPos = first.pos
-            lastFlyGrounded = first.isGrounded
-            lastFlyVisible = !first.node.isHidden
+            lastFlyGrounded = first.isGrounded && !first.isHiding
+            lastFlyVisible = first.isTargetable
             lastFlyRadius = first.visualRadius
+            lastFlyJumpscaring = first.isJumpscaring
             lock.unlock()
         }
     }
@@ -932,7 +985,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         scnView.scene = coordinator.scene; scnView.backgroundColor = .clear
         scnView.allowsCameraControl = false; scnView.antialiasingMode = .multisampling4X
         scnView.preferredFramesPerSecond = 120; scnView.delegate = coordinator; scnView.isPlaying = true
-        window.contentView = scnView; window.orderFrontRegardless()
+        // Keep the transparent desktop stage out of the window stack until the
+        // creature actually arrives; the 3D gift should be the only opening act.
+        window.contentView = scnView; window.orderOut(nil)
 
         setupStatusItem(); setupGiftWindow(); setupInputAndTimers()
         giftWindow?.showCentered()
@@ -955,7 +1010,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowTimer = Timer.scheduledTimer(withTimeInterval: 0.7, repeats: true) { [weak self] _ in
             guard let self else { return }
             let snap = self.windowSense.poll(screen: self.screenFrame)
-            self.coordinator.setTerrain(snap.ledges)
+            self.coordinator.setTerrain(snap.ledges, windows: snap.windows)
             let flyPos = self.coordinator.flyPosition()
             for nw in snap.newWindows {
                 let d = hypot(nw.center.x - flyPos.x, nw.center.y - flyPos.y)
@@ -963,7 +1018,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if strength > 0.08 { self.coordinator.injectWindowLoom(strength: strength, at: nw.center) }
             }
         }
-        clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in self?.handleMissedSwing() }
+        clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in
+            guard let self else { return }
+            if self.isCursorOnFly(global: NSEvent.mouseLocation) { self.handleFlyClick() }
+            else { self.handleMissedSwing() }
+        }
         challengeTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in self?.advanceGame() }
         escapeTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.pollEscapeKey() }
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
@@ -984,24 +1043,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let sleepy = (idle > 600 && (h >= 22 || h < 6)) || idle > 1800
         coordinator.setAmbient(typing: typingLevel, sleepy: sleepy, tempo: thermalTempo(), activity: circadianActivity(hour: h))
 
-        hitWindow.update(at: loc, active: game.phase == .challenge && game.armed && sceneHitTest(global: loc))
+        hitWindow.update(at: loc, active: game.phase == .challenge && game.armed && isCursorOnFly(global: loc))
         if let snap = coordinator.flySnapshot(), snap.visible {
             let pan = Float(clampf(snap.position.x / max(1, screenFrame.width / 2), -1, 1))
-            audio.setFlying(snap.flying && game.phase == .challenge, pan: pan)
+            audio.setFlying(snap.flying && game.phase == .challenge, pan: pan,
+                            close: snap.jumpscaring)
         } else { audio.setFlying(false, pan: 0) }
     }
 
-    private func sceneHitTest(global: CGPoint) -> Bool {
-        let local = CGPoint(x: global.x - screenFrame.minX, y: global.y - screenFrame.minY)
-        let hits = scnView.hitTest(local, options: [SCNHitTestOption.searchMode: SCNHitTestSearchMode.all.rawValue])
-        return hits.contains { hit in
-            var node: SCNNode? = hit.node
-            while let n = node {
-                if n.name == "flyRoot" { return true }
-                node = n.parent
-            }
-            return false
-        }
+    private func isCursorOnFly(global: CGPoint) -> Bool {
+        guard let snap = coordinator.flySnapshot(), snap.visible else { return false }
+        let scene = CGPoint(x: global.x - screenFrame.midX, y: global.y - screenFrame.midY)
+        return flyHitTest(cursor: scene, center: snap.position, visualRadius: snap.radius)
     }
 
     private func armSwatter() {
@@ -1012,7 +1065,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func advanceGame() {
         let now = ProcessInfo.processInfo.systemUptime
         if game.shouldSpawn(now: now) {
-            game.spawn(now: now); coordinator.spawnGiftFly(); statusItem.button?.title = "🪰"
+            game.spawn(now: now); coordinator.spawnGiftFly(); window.orderFrontRegardless()
+            statusItem.button?.title = "🪰"
             if game.armed { giftWindow?.window?.orderOut(nil) }
             else if let screen = screenForCurrentFrame() { giftWindow?.collapseToTray(on: screen) }
         }

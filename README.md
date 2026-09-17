@@ -13,13 +13,20 @@ the Apple GPU.
 
 ## The gift
 
-FlyGift begins as a deliberately suspicious retro present. Open it, pick up the
-fly swatter, and wait. A procedural 3D fruit fly emerges after a random delay.
+FlyGift begins as a deliberately suspicious, fully rendered 3D present. Open
+the box, click the red Chinese-style plastic fly swatter to pick it up, and
+wait. A morphology-informed fruit fly emerges after a random delay.
 Its approach response enters the real LC4/LPLC2 looming circuit; it takes off
 when the simulated DNp01 / Giant Fiber actually spikes. You have 60 seconds to
 catch it while it is grounded.
 
 - The first 50 seconds have no HUD; a countdown appears for the final 10.
+- The fly can cross between real desktop windows, land on their edges, hide
+  beneath them, and rush toward the camera once during the challenge.
+- The visible body uses a dorsal *Drosophila* reference with red compound eyes,
+  a tan thorax, segmented abdomen, translucent veined wings, and six fine legs.
+- Hits use the visible silhouette plus a small eight-point forgiveness margin,
+  so convincing contact counts without turning nearby clicks into hits.
 - Double-press `Esc`, use the menu-bar gift icon, or press `Cmd-Q` to quit.
 - The app is offline, has no analytics, and requests no Screen Recording or
   Accessibility permission.

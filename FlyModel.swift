@@ -83,6 +83,7 @@ struct FlyModel {
     let blurWingL: SCNNode
     let blurWingR: SCNNode
     let abdomen: SCNNode
+    let realisticSprite: SCNNode?
 }
 
 func buildLeg(attach: SCNVector3, baseYaw: CGFloat, swingSign: CGFloat, phase: CGFloat,
@@ -139,6 +140,26 @@ func wingShape() -> SCNGeometry {
     m.isDoubleSided = true
     shape.materials = [m]
     return shape
+}
+
+func realisticFlySprite() -> SCNNode? {
+    guard let url = findResource("fly-realistic-v2.png")
+            ?? findResource("assets/fly-realistic-v2.png"),
+          let image = NSImage(contentsOf: url) else { return nil }
+    let plane = SCNPlane(width: 30, height: 31)
+    let material = SCNMaterial()
+    material.lightingModel = .constant
+    material.diffuse.contents = image
+    material.isDoubleSided = true
+    material.blendMode = .alpha
+    material.readsFromDepthBuffer = false
+    material.writesToDepthBuffer = false
+    plane.materials = [material]
+    let node = SCNNode(geometry: plane)
+    node.name = "realisticFlySprite"
+    node.position = SCNVector3(0, 0, 10.5)
+    node.renderingOrder = 20
+    return node
 }
 
 func buildFlyModel() -> FlyModel {
@@ -245,8 +266,18 @@ func buildFlyModel() -> FlyModel {
     root.addChildNode(bl)
     root.addChildNode(br)
 
+    // At desktop scale a calibrated dorsal specimen reads much more naturally
+    // than bare primitives. The procedural body remains as a fallback when the
+    // packaged specimen texture cannot be loaded.
+    let sprite = realisticFlySprite()
+    if let sprite {
+        for child in root.childNodes { child.isHidden = true }
+        root.addChildNode(sprite)
+    }
+
     return FlyModel(root: root, legs: legs, foldedWings: foldedWings,
-                    blurWingL: bl, blurWingR: br, abdomen: abdomen)
+                    blurWingL: bl, blurWingR: br, abdomen: abdomen,
+                    realisticSprite: sprite)
 }
 
 // MARK: - Behavior
@@ -270,7 +301,15 @@ final class Fly {
     var dartTimer: CGFloat = 0
     var stateAge: CGFloat = 0
     var terrain: [Ledge] = []      // walkable window edges, set by the coordinator
+    var windows: [WindowRegion] = []
     var ledge: Ledge?              // currently attached window edge
+    var hidingAllowed = false
+    private(set) var isHiding = false
+    private var hideOrigin = CGPoint.zero
+    private var hideTarget = CGPoint.zero
+    private var hideAge: CGFloat = 0
+    private var hideHold: CGFloat = 0
+    private var hideCooldown: CGFloat = 4
 
     var gaitPhasePublic: CGFloat { gaitPhase }
     var walkingIntensity: CGFloat {
@@ -291,9 +330,12 @@ final class Fly {
     private var liveArousal: CGFloat = 0
     private var liveWing: CGFloat = 0
     private var exitAfterFlight = false
+    private(set) var isJumpscaring = false
+    private var jumpscareNear = CGPoint.zero
 
     var isGrounded: Bool { state != .flying }
-    var visualRadius: CGFloat { 22 * (1 + 0.8 * alt) }
+    var visualRadius: CGFloat { isJumpscaring ? 120 : 22 * (1 + 0.8 * alt) }
+    var isTargetable: Bool { !isHiding && !node.isHidden && node.opacity > 0.8 }
 
     init(at p: CGPoint) {
         model = buildFlyModel()
@@ -308,6 +350,10 @@ final class Fly {
 
     func startFlight(bounds: CGSize, awayFrom: CGPoint? = nil, escape: Bool = false,
                      effort: CGFloat? = nil) {
+        let originLedgeID = ledge?.id
+        isHiding = false
+        isJumpscaring = false
+        node.opacity = 1
         exitAfterFlight = false
         state = .flying
         ledge = nil
@@ -319,12 +365,15 @@ final class Fly {
         let hw = bounds.width / 2 - EDGE_MARGIN, hh = bounds.height / 2 - EDGE_MARGIN
         var target = CGPoint.zero
         var chosen = false
-        // casual flights often land on a window edge
-        if !escape, awayFrom == nil, !terrain.isEmpty, rnd(0...1) < 0.45 {
-            let L = terrain[Int.random(in: 0..<terrain.count)]
+        // Casual flights strongly prefer another real window edge. This makes
+        // the fly visibly commute between apps instead of teleporting around a
+        // single window, while the connectome still decides when it takes off.
+        let otherLedges = terrain.filter { $0.id != originLedgeID }
+        if !escape, awayFrom == nil, !otherLedges.isEmpty, rnd(0...1) < 0.76 {
+            let L = otherLedges[Int.random(in: 0..<otherLedges.count)]
             if L.x1 - L.x0 > 90 {
                 target = CGPoint(x: rnd((L.x0 + 25)...(L.x1 - 25)), y: L.y)
-                chosen = hypot(target.x - pos.x, target.y - pos.y) > 180
+                chosen = hypot(target.x - pos.x, target.y - pos.y) > 130
             }
         }
         if !chosen {
@@ -352,6 +401,9 @@ final class Fly {
     }
 
     func startExitFlight(bounds: CGSize) {
+        isHiding = false
+        isJumpscaring = false
+        node.opacity = 1
         state = .flying
         ledge = nil
         exitAfterFlight = true
@@ -374,7 +426,69 @@ final class Fly {
         flightT = max(flightT, 0.98)
     }
 
+    func startJumpscare(bounds: CGSize) {
+        guard !isJumpscaring, !node.isHidden else { return }
+        isHiding = false; node.opacity = 1; ledge = nil
+        state = .flying; isJumpscaring = true; exitAfterFlight = false
+        flightFrom = pos
+        jumpscareNear = CGPoint(x: rnd(-70...70), y: rnd(-35...95))
+        let candidates = terrain.filter { hypot($0.y - pos.y, ($0.x0 + $0.x1) / 2 - pos.x) > 180 }
+        if let target = candidates.randomElement() {
+            flightTo = CGPoint(x: rnd((target.x0 + 24)...(target.x1 - 24)), y: target.y)
+        } else {
+            flightTo = CGPoint(x: rnd((-bounds.width / 2 + 80)...(bounds.width / 2 - 80)),
+                               y: rnd((-bounds.height / 2 + 80)...(bounds.height / 2 - 80)))
+        }
+        flightT = 0; flightDur = 1.18; flightEffort = 1.2; effortCurrent = 1.2
+        flapPhase = 0; wingRaise = 0
+    }
+
+    func startHiding(in region: WindowRegion, hold: CGFloat? = nil) {
+        guard state != .flying, !isHiding else { return }
+        isHiding = true
+        state = .idle
+        speed = 0
+        hideAge = 0
+        hideHold = hold ?? rnd(1.1...2.8)
+        hideOrigin = pos
+        hideTarget = CGPoint(x: clampf(pos.x + rnd(-12...12),
+                                       region.rect.minX + 18, region.rect.maxX - 18),
+                             y: max(region.rect.minY + 12, region.rect.maxY - 24))
+    }
+
+    func finishHidingSoon() {
+        guard isHiding else { return }
+        hideAge = max(hideAge, 0.32 + hideHold)
+    }
+
+    private func updateHiding(dt: CGFloat) {
+        hideAge += dt
+        let slide: CGFloat = 0.32
+        let total = slide * 2 + hideHold
+        if hideAge < slide {
+            let e = smoothstep(hideAge / slide)
+            pos.x = hideOrigin.x + (hideTarget.x - hideOrigin.x) * e
+            pos.y = hideOrigin.y + (hideTarget.y - hideOrigin.y) * e
+            node.opacity = 1 - e
+        } else if hideAge < slide + hideHold {
+            pos = hideTarget
+            node.opacity = 0
+        } else if hideAge < total {
+            let e = smoothstep((hideAge - slide - hideHold) / slide)
+            pos.x = hideTarget.x + (hideOrigin.x - hideTarget.x) * e
+            pos.y = hideTarget.y + (hideOrigin.y - hideTarget.y) * e
+            node.opacity = e
+        } else {
+            pos = hideOrigin
+            node.opacity = 1
+            isHiding = false
+            hideCooldown = rnd(5...10)
+            stateTimer = rnd(0.4...1.2)
+        }
+    }
+
     private func land() {
+        isJumpscaring = false
         state = .idle
         stateTimer = rnd(0.3...0.8)
         speed = 0
@@ -417,6 +531,7 @@ final class Fly {
         scareCooldown = max(0, scareCooldown - dt)
         dartCooldown = max(0, dartCooldown - dt)
         backwardTimer = max(0, backwardTimer - dt)
+        hideCooldown = max(0, hideCooldown - dt)
 
         stateAge += dt
         dartTimer = max(0, dartTimer - dt)
@@ -425,6 +540,20 @@ final class Fly {
         brainLive = signals != nil
         liveArousal = signals?.arousal ?? 0
         liveWing = signals?.wingDrive ?? 0
+
+        if isHiding {
+            // Hiding never masks the real emergency pathway: a Giant Fiber
+            // spike still pulls the fly straight out from behind the window.
+            if let s = signals, s.escape && scareCooldown == 0 {
+                startFlight(bounds: bounds, awayFrom: mouse, escape: true)
+            } else {
+                updateHiding(dt: dt)
+                updateLegs(dt: dt)
+                updateWings(dt: dt)
+                syncNode()
+                return
+            }
+        }
 
         if state == .flying {
             updateFlight(dt: dt)
@@ -453,6 +582,13 @@ final class Fly {
                 }
                 if state == .walking { updateWalk(dt: dt, bounds: bounds) }
             }
+        }
+
+        if hidingAllowed, state != .flying, hideCooldown == 0,
+           let attached = ledge,
+           let region = windows.first(where: { $0.id == attached.id }),
+           stateAge > 0.8, rnd(0...1) < 0.16 * dt {
+            startHiding(in: region)
         }
 
         updateLegs(dt: dt)
@@ -571,11 +707,9 @@ final class Fly {
             pos.y = clampf(pos.y, -bounds.height / 2 + 20, bounds.height / 2 - 20)
             // walked onto a window edge? latch on
             for L in terrain where pos.x > L.x0 - 8 && pos.x < L.x1 + 8 && abs(pos.y - L.y) < 20 {
-                if rnd(0...1) < 0.9 * dt {
-                    ledge = L
-                    heading = cos(heading) >= 0 ? 0 : .pi
-                    break
-                }
+                ledge = L
+                heading = cos(heading) >= 0 ? 0 : .pi
+                break
             }
         }
         var p = node.position
@@ -593,6 +727,10 @@ final class Fly {
 
     private func updateFlight(dt: CGFloat) {
         flightT = min(1, flightT + dt / flightDur)
+        if isJumpscaring {
+            updateJumpscareFlight()
+            return
+        }
         if flightT >= 1 {
             if exitAfterFlight {
                 pos = flightTo
@@ -633,6 +771,38 @@ final class Fly {
         alt += (target - alt) * min(1, 6 * dt)
         // higher = closer to the viewer = bigger, and the shadow slides away
         applyAltitude()
+    }
+
+    private func updateJumpscareFlight() {
+        if flightT >= 1 {
+            pos = flightTo; alt = 0; node.opacity = 1
+            land(); return
+        }
+        let approachEnd: CGFloat = 0.54
+        let holdEnd: CGFloat = 0.66
+        let scale: CGFloat
+        if flightT < approachEnd {
+            let e = smoothstep(flightT / approachEnd)
+            pos.x = flightFrom.x + (jumpscareNear.x - flightFrom.x) * e
+            pos.y = flightFrom.y + (jumpscareNear.y - flightFrom.y) * e
+            scale = FLY_SCALE * (1 + 5.6 * e * e)
+            heading = atan2(jumpscareNear.y - flightFrom.y, jumpscareNear.x - flightFrom.x) + sin(time * 35) * 0.08
+            alt = e
+        } else if flightT < holdEnd {
+            pos.x = jumpscareNear.x + sin(time * 45) * 5
+            pos.y = jumpscareNear.y + cos(time * 39) * 4
+            scale = FLY_SCALE * 6.6
+            alt = 1
+        } else {
+            let e = smoothstep((flightT - holdEnd) / (1 - holdEnd))
+            pos.x = jumpscareNear.x + (flightTo.x - jumpscareNear.x) * e
+            pos.y = jumpscareNear.y + (flightTo.y - jumpscareNear.y) * e
+            scale = FLY_SCALE * (6.6 - 5.6 * e)
+            heading = atan2(flightTo.y - jumpscareNear.y, flightTo.x - jumpscareNear.x) + sin(time * 26) * 0.08
+            alt = 1 - e
+        }
+        node.scale = SCNVector3(scale, scale, scale)
+        var p = node.position; p.z = 165 * alt; node.position = p
     }
 
     private func updateLegs(dt: CGFloat) {
@@ -685,17 +855,16 @@ final class Fly {
 
     private func updateWings(dt: CGFloat) {
         guard state == .flying else {
+            model.realisticSprite?.scale = SCNVector3(1, 1, 1)
             // grounded threat posture: escape-DN / loom activity raises the wings
-            if !model.foldedWings.isHidden {
-                let raiseTarget: CGFloat = (state != .sleeping
-                    && (liveWing > 0.7 || (brainLive && dartTimer > 0))) ? 1 : 0
-                wingRaise += (raiseTarget - wingRaise) * min(1, 8 * dt)
-                if wingRaise > 0.01 {
-                    for (i, wing) in model.foldedWings.childNodes.enumerated() {
-                        let side: CGFloat = i == 0 ? -1 : 1
-                        wing.eulerAngles = SCNVector3(-0.5 * wingRaise, 0,
-                                                      side * (0.13 + 0.3 * wingRaise))
-                    }
+            let raiseTarget: CGFloat = (state != .sleeping
+                && (liveWing > 0.7 || (brainLive && dartTimer > 0))) ? 1 : 0
+            wingRaise += (raiseTarget - wingRaise) * min(1, 8 * dt)
+            if wingRaise > 0.01 {
+                for (i, wing) in model.foldedWings.childNodes.enumerated() {
+                    let side: CGFloat = i == 0 ? -1 : 1
+                    wing.eulerAngles = SCNVector3(-0.5 * wingRaise, 0,
+                                                  side * (0.13 + 0.3 * wingRaise))
                 }
             }
             return
@@ -704,6 +873,10 @@ final class Fly {
         // faster when the live effort is higher
         flapPhase = (flapPhase + dt * (14 + 10 * effortCurrent)).truncatingRemainder(dividingBy: 1)
         let stroke = sin(flapPhase * 2 * .pi)
+        // A tiny breathing squash preserves the photographic silhouette while
+        // giving the high-frequency wing beat a readable shimmer at 30–50 px.
+        model.realisticSprite?.scale = SCNVector3(1 + 0.035 * abs(stroke),
+                                                  1 - 0.018 * abs(stroke), 1)
         for (i, wing) in model.foldedWings.childNodes.enumerated() {
             let side: CGFloat = i == 0 ? -1 : 1
             wing.eulerAngles = SCNVector3(stroke * 0.35, 0,
