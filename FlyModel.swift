@@ -143,6 +143,7 @@ func wingShape() -> SCNGeometry {
 
 func buildFlyModel() -> FlyModel {
     let root = SCNNode()
+    root.name = "flyRoot"
     root.scale = SCNVector3(FLY_SCALE, FLY_SCALE, FLY_SCALE)
 
     let bodyBrown = NSColor(calibratedRed: 0.50, green: 0.38, blue: 0.22, alpha: 1)
@@ -289,6 +290,10 @@ final class Fly {
     private var brainLive = false
     private var liveArousal: CGFloat = 0
     private var liveWing: CGFloat = 0
+    private var exitAfterFlight = false
+
+    var isGrounded: Bool { state != .flying }
+    var visualRadius: CGFloat { 22 * (1 + 0.8 * alt) }
 
     init(at p: CGPoint) {
         model = buildFlyModel()
@@ -303,6 +308,7 @@ final class Fly {
 
     func startFlight(bounds: CGSize, awayFrom: CGPoint? = nil, escape: Bool = false,
                      effort: CGFloat? = nil) {
+        exitAfterFlight = false
         state = .flying
         ledge = nil
         flightEffort = clampf(effort ?? (escape ? 1.0 : rnd(0.4...0.75)), 0.25, 1)
@@ -343,6 +349,29 @@ final class Fly {
         // wings stay visible and beat; blur discs add the motion-smear
         model.blurWingL.isHidden = false
         model.blurWingR.isHidden = false
+    }
+
+    func startExitFlight(bounds: CGSize) {
+        state = .flying
+        ledge = nil
+        exitAfterFlight = true
+        flightEffort = 1.0
+        effortCurrent = 1.0
+        flapPhase = 0
+        wingRaise = 0
+        flightFrom = pos
+        let side: CGFloat = pos.x >= 0 ? 1 : -1
+        flightTo = CGPoint(x: side * (bounds.width / 2 + 220),
+                           y: clampf(pos.y + rnd(-140...140), -bounds.height / 2, bounds.height / 2))
+        flightT = 0
+        flightDur = 1.05
+        model.blurWingL.isHidden = false
+        model.blurWingR.isHidden = false
+    }
+
+    func forceLandingSoon() {
+        guard state == .flying, !exitAfterFlight else { return }
+        flightT = max(flightT, 0.98)
     }
 
     private func land() {
@@ -565,6 +594,13 @@ final class Fly {
     private func updateFlight(dt: CGFloat) {
         flightT = min(1, flightT + dt / flightDur)
         if flightT >= 1 {
+            if exitAfterFlight {
+                pos = flightTo
+                alt = 1
+                node.isHidden = true
+                syncNode()
+                return
+            }
             // touchdown flare: the timer ended, but the fly lands only when it
             // has actually descended — hover over the target and settle down.
             pos.x = flightTo.x + sin(time * 26) * 1.2

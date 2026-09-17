@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FlyGift — 一份礼物正在等你</title>
+  <meta name="description" content="一位朋友给你留了一份可以在 Mac 上打开的互动礼物。">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="有人给你留了一份礼物">
+  <meta property="og:description" content="在 Apple Silicon Mac 上打开这份神秘的互动礼物。">
+  <meta property="og:url" content="https://thomaslin070217.github.io/FlyGift/">
+  <meta property="og:image" content="https://thomaslin070217.github.io/FlyGift/assets/og-gift.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="有人给你留了一份礼物">
+  <meta name="twitter:description" content="A gift is waiting.">
+  <meta name="twitter:image" content="https://thomaslin070217.github.io/FlyGift/assets/og-gift.png">
+  <meta name="theme-color" content="#6e120c">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="masthead">
+      <a class="brand" href="./" aria-label="FlyGift home">FLY<span>GIFT</span></a>
+      <button id="language-toggle" class="language" type="button" aria-label="Switch language">中 / EN</button>
+    </header>
+
+    <section class="card" aria-live="polite">
+      <div class="image-wrap">
+        <img src="assets/og-gift.png" width="1200" height="630" alt="An unopened vintage gift box">
+        <div class="stamp" aria-hidden="true">HANDLE<br>WITH CARE</div>
+      </div>
+
+      <div id="creator-view" class="content" hidden>
+        <p class="eyebrow" data-copy="makerEyebrow"></p>
+        <h1 data-copy="makerTitle"></h1>
+        <p class="lede" data-copy="makerBody"></p>
+        <label class="field-label" for="sender-name" data-copy="nameLabel"></label>
+        <input id="sender-name" maxlength="24" autocomplete="name" data-placeholder="namePlaceholder">
+        <div class="link-preview">
+          <span data-copy="previewLabel"></span>
+          <strong id="gift-link"></strong>
+        </div>
+        <div class="actions">
+          <button id="share-button" class="primary" type="button" data-copy="share"></button>
+          <button id="copy-button" class="secondary" type="button" data-copy="copy"></button>
+        </div>
+        <p id="creator-status" class="status" role="status"></p>
+      </div>
+
+      <div id="recipient-view" class="content" hidden>
+        <p class="eyebrow" data-copy="recipientEyebrow"></p>
+        <h1><span id="sender-display"></span><span data-copy="recipientTitle"></span></h1>
+        <p class="lede" data-copy="recipientBody"></p>
+        <div class="actions">
+          <a id="download-button" class="primary button-link" href="https://github.com/ThomasLin070217/FlyGift/releases/latest/download/FlyGift-macOS-arm64.zip" data-copy="download"></a>
+          <button id="decline-button" class="secondary" type="button" data-copy="decline"></button>
+          <button id="recipient-copy-button" class="secondary" type="button" data-copy="copy"></button>
+        </div>
+        <p id="device-note" class="device-note"></p>
+        <div id="open-help" class="open-help" hidden>
+          <strong data-copy="downloaded"></strong>
+          <ol>
+            <li data-copy="step1"></li>
+            <li data-copy="step2"></li>
+            <li data-copy="step3"></li>
+          </ol>
+        </div>
+      </div>
+
+      <div class="facts" aria-label="Download facts">
+        <span>Apple Silicon</span>
+        <span>macOS 15+</span>
+        <span>≈ 100 MB</span>
+        <span data-copy="unsigned"></span>
+      </div>
+      <details>
+        <summary data-copy="safetyTitle"></summary>
+        <p data-copy="safetyBody"></p>
+        <p><a href="https://github.com/ThomasLin070217/FlyGift" data-copy="source"></a> · <a href="https://github.com/ThomasLin070217/FlyGift/releases/latest/download/SHA256SUMS.txt" data-copy="checksum"></a></p>
+      </details>
+    </section>
+  </main>
+  <script src="app.js" defer></script>
+</body>
+</html>

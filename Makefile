@@ -1,8 +1,8 @@
 .PHONY: run fly
 
-# Launch the fly; quit from the menu-bar 🪰.
+# Launch FlyGift; quit from the menu-bar gift icon.
 run:
-	@./SiliconFly
+	@./FlyGift
 
 # Same as `make run`.
 fly: run

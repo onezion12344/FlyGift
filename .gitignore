@@ -1,4 +1,7 @@
 SiliconFly
+FlyGift
+build/
+outputs/
 .DS_Store
 *.log
 nohup.out

@@ -497,7 +497,7 @@ func runBehaviorTest() {
         let fly = Fly(at: .zero)
         fly.state = .idle
         fly.startFlight(bounds: bounds, effort: 0.5)
-        var calm = BrainSignals()
+        let calm = BrainSignals()
         for _ in 0..<12 { fly.update(dt: dt, bounds: bounds, mouse: nil, signals: calm) }
         let calmEffort = fly.effortCurrent
         var hot = BrainSignals(); hot.wingDrive = 1.0; hot.arousal = 0.6
@@ -596,6 +596,14 @@ final class SignalBuilder {
 
 // MARK: - Coordinator
 
+struct FlySnapshot {
+    let position: CGPoint
+    let grounded: Bool
+    let flying: Bool
+    let visible: Bool
+    let radius: CGFloat
+}
+
 final class Coordinator: NSObject, SCNSceneRendererDelegate {
     let scene: SCNScene
     var bounds: CGSize
@@ -624,27 +632,60 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
     private var windowLoomL: Float = 0
     private var windowLoomR: Float = 0
     private(set) var lastFlyPos = CGPoint.zero
+    private var lastFlyGrounded = false
+    private var lastFlyVisible = false
+    private var lastFlyRadius: CGFloat = 22
+    private var challengeActive = false
+    private var challengeElapsed: CGFloat = 0
+    private var flightContinuous: CGFloat = 0
+    private var groundedContinuous: CGFloat = 0
+    private var groundedOpportunities = 0
+    private var countedCurrentGround = false
 
-    init(bounds: CGSize, sim: MetalSim?) {
+    init(bounds: CGSize, sim: MetalSim?, spawnInitially: Bool = true) {
         self.bounds = bounds
         self.sim = sim
         self.scene = buildScene(bounds: bounds)
         super.init()
-        enqueue { $0.addFlyNow() }
+        if spawnInitially { enqueue { $0.addFlyNow() } }
     }
 
     func enqueue(_ action: @escaping (Coordinator) -> Void) {
         lock.lock(); pending.append(action); lock.unlock()
     }
 
-    private func addFlyNow() {
+    private func addFlyNow(at requested: CGPoint? = nil) {
         let hw = bounds.width / 2 - 100, hh = bounds.height / 2 - 100
-        let fly = Fly(at: CGPoint(x: rnd(-hw...hw), y: rnd(-hh...hh)))
+        let start = requested ?? CGPoint(x: rnd(-hw...hw), y: rnd(-hh...hh))
+        let fly = Fly(at: CGPoint(x: clampf(start.x, -hw, hw), y: clampf(start.y, -hh, hh)))
         scene.rootNode.addChildNode(fly.node)
         flies.append(fly)
     }
 
     func addFly() { enqueue { $0.addFlyNow() } }
+    func spawnGiftFly(at point: CGPoint = .zero) {
+        enqueue { c in
+            for old in c.flies { old.node.removeFromParentNode() }
+            c.flies.removeAll()
+            c.addFlyNow(at: point)
+            c.challengeActive = true
+            c.challengeElapsed = 0
+            c.flightContinuous = 0
+            c.groundedContinuous = 0
+            c.groundedOpportunities = 0
+            c.countedCurrentGround = false
+        }
+    }
+    func stopChallenge() { enqueue { $0.challengeActive = false } }
+    func markFlyKilled() {
+        enqueue { c in c.challengeActive = false; c.flies.first?.node.isHidden = true }
+    }
+    func flyAway() {
+        enqueue { c in
+            c.challengeActive = false
+            c.flies.first?.startExitFlight(bounds: c.bounds)
+        }
+    }
     func removeFly() {
         enqueue { c in
             guard c.flies.count > 1 else { return }   // fly #1 carries the brain
@@ -686,6 +727,13 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
         }
     }
     func flyPosition() -> CGPoint { lock.lock(); defer { lock.unlock() }; return lastFlyPos }
+    func flySnapshot() -> FlySnapshot? {
+        lock.lock(); defer { lock.unlock() }
+        guard lastFlyVisible else { return nil }
+        return FlySnapshot(position: lastFlyPos, grounded: lastFlyGrounded,
+                           flying: !lastFlyGrounded, visible: lastFlyVisible,
+                           radius: lastFlyRadius)
+    }
 
     // a window appeared near the fly: a real looming object
     func injectWindowLoom(strength: CGFloat, at p: CGPoint) {
@@ -795,101 +843,115 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
             fly.update(dt: dt, bounds: bounds, mouse: mouse, signals: i == 0 ? signals : nil)
         }
         if let first = flies.first {
-            lock.lock(); lastFlyPos = first.pos; lock.unlock()
+            if challengeActive {
+                challengeElapsed += dt
+                if first.state == .flying {
+                    flightContinuous += dt
+                    groundedContinuous = 0
+                    countedCurrentGround = false
+                    if flightContinuous > 12 { first.forceLandingSoon() }
+                } else {
+                    flightContinuous = 0
+                    groundedContinuous += dt
+                    if groundedContinuous >= 0.75, !countedCurrentGround {
+                        groundedOpportunities += 1
+                        countedCurrentGround = true
+                    }
+                    let target = challengeElapsed >= 44 ? 3 : (challengeElapsed >= 26 ? 2 : (challengeElapsed >= 8 ? 1 : 0))
+                    if groundedOpportunities < target, groundedContinuous > 2.0 {
+                        first.startFlight(bounds: bounds, effort: 0.42)
+                        groundedContinuous = 0
+                        countedCurrentGround = false
+                    }
+                }
+            }
+            lock.lock()
+            lastFlyPos = first.pos
+            lastFlyGrounded = first.isGrounded
+            lastFlyVisible = !first.node.isHidden
+            lastFlyRadius = first.visualRadius
+            lock.unlock()
         }
     }
 }
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        // only offer the display hop when there is somewhere to hop to
-        moveDisplayItem?.isHidden = NSScreen.screens.count < 2
-    }
-
+final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var scnView: SCNView!
     var coordinator: Coordinator!
     var statusItem: NSStatusItem!
     var mouseTimer: Timer?
     var windowTimer: Timer?
+    var challengeTimer: Timer?
+    var escapeTimer: Timer?
+    var revealTimer: Timer?
     var clickMonitor: Any?
     let windowSense = WindowSense()
     var typingLevel: CGFloat = 0
-    var paused = false
-    var brainWC: BrainWindowController?
     var dataInfo = "no data — run etl.py"
     var screenFrame = NSRect.zero
-    var moveDisplayItem: NSMenuItem?
+    let game = ChallengeController()
+    let audio = FlyAudioController()
+    let swatterOverlay = SwatterOverlayController()
+    let hitWindow = FlyHitWindowController()
+    let countdownWindow = CountdownWindowController()
+    var giftWindow: GiftWindowController?
+    var resultWindow: ResultWindowController?
+    var splatWindow: SplatWindowController?
+    var language = GiftLanguage.systemDefault
+    var lastEscapeDown = false
+    var escapeDetector = DoublePressDetector()
+    var didCleanUp = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard let screen = NSScreen.main else { fatalError("no screen") }
-        let frame = screen.frame
-        screenFrame = frame
+        screenFrame = screen.frame
 
-        var sim: MetalSim? = nil
         let spikeBus = SpikeBus()
-        var connectome: Connectome? = nil
-        if let c = loadConnectome(),
-           let s = MetalSim(connectome: c, spikeBus: spikeBus, seed: launchSeed()) {
+        var sim: MetalSim?
+        if let c = loadConnectome(), let s = MetalSim(connectome: c, spikeBus: spikeBus, seed: launchSeed()) {
             sim = s
-            connectome = c
             dataInfo = "\(c.summary) · \(s.deviceName)"
         }
+        guard sim != nil else {
+            let alert = NSAlert()
+            alert.messageText = "FlyGift could not start"
+            alert.informativeText = "The FlyWire connectome or Metal GPU could not be loaded."
+            alert.runModal(); NSApp.terminate(nil); return
+        }
 
-        coordinator = Coordinator(bounds: frame.size, sim: sim)
-
-        window = NSWindow(contentRect: frame, styleMask: [.borderless],
-                          backing: .buffered, defer: false)
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.hasShadow = false
-        window.level = .floating
-        window.ignoresMouseEvents = true
+        coordinator = Coordinator(bounds: screen.frame.size, sim: sim, spawnInitially: false)
+        window = NSWindow(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isOpaque = false; window.backgroundColor = .clear; window.hasShadow = false
+        window.level = .floating; window.ignoresMouseEvents = true
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
 
-        scnView = SCNView(frame: NSRect(origin: .zero, size: frame.size))
-        scnView.scene = coordinator.scene
-        scnView.backgroundColor = .clear
-        scnView.allowsCameraControl = false
-        scnView.antialiasingMode = .multisampling4X
-        scnView.preferredFramesPerSecond = 120   // ProMotion; caps at display refresh
-        if ProcessInfo.processInfo.environment["DESKTOPFLY_FPS"] != nil {
-            fputs("display max fps: \(NSScreen.main?.maximumFramesPerSecond ?? 0)\n", stderr)
-        }
-        scnView.delegate = coordinator
-        scnView.isPlaying = true
-        window.contentView = scnView
-        window.orderFrontRegardless()
+        scnView = SCNView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        scnView.scene = coordinator.scene; scnView.backgroundColor = .clear
+        scnView.allowsCameraControl = false; scnView.antialiasingMode = .multisampling4X
+        scnView.preferredFramesPerSecond = 120; scnView.delegate = coordinator; scnView.isPlaying = true
+        window.contentView = scnView; window.orderFrontRegardless()
 
-        if let sim = sim, let c = connectome {
-            let wc = BrainWindowController(connectome: c, sim: sim, screen: screen)
-            wc.show()
-            brainWC = wc
-        }
+        setupStatusItem(); setupGiftWindow(); setupInputAndTimers()
+        giftWindow?.showCentered()
+    }
 
-        setupStatusItem()
-
-        mouseTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+    private func setupGiftWindow() {
+        let wc = GiftWindowController(); language = wc.language
+        wc.onOpen = { [weak self] in
             guard let self else { return }
-            let loc = NSEvent.mouseLocation
-            self.coordinator.setMouse(CGPoint(x: loc.x - self.screenFrame.midX,
-                                              y: loc.y - self.screenFrame.midY))
-            // typing = substrate vibration (when, never what)
-            let keyIdle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown)
-            self.typingLevel += ((keyIdle < 0.6 ? 1.0 : 0.0) - self.typingLevel) * 0.15
-            // circadian hour + sleep from user idleness + thermal tempo
-            let idle = userIdleSeconds()
-            let now = Date()
-            let comps = Calendar.current.dateComponents([.hour, .minute], from: now)
-            let h = Double(comps.hour ?? 12) + Double(comps.minute ?? 0) / 60
-            let sleepy = (idle > 600 && (h >= 22 || h < 6)) || idle > 1800
-            self.coordinator.setAmbient(typing: self.typingLevel, sleepy: sleepy,
-                                        tempo: thermalTempo(), activity: circadianActivity(hour: h))
+            self.game.openGift(now: ProcessInfo.processInfo.systemUptime, delay: Double.random(in: 3...8))
         }
+        wc.onArm = { [weak self] in self?.armSwatter() }
+        wc.onLanguageChange = { [weak self] lang in self?.language = lang }
+        giftWindow = wc
+        hitWindow.onClick = { [weak self] in self?.handleFlyClick() }
+    }
 
-        // window terrain + new-window looms, ~1.4 Hz
+    private func setupInputAndTimers() {
+        mouseTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.updatePointerAndEnvironment() }
         windowTimer = Timer.scheduledTimer(withTimeInterval: 0.7, repeats: true) { [weak self] _ in
             guard let self else { return }
             let snap = self.windowSense.poll(screen: self.screenFrame)
@@ -898,88 +960,160 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             for nw in snap.newWindows {
                 let d = hypot(nw.center.x - flyPos.x, nw.center.y - flyPos.y)
                 let strength = clampf(1 - d / 480, 0, 1) * 0.75
-                if strength > 0.08 {
-                    self.coordinator.injectWindowLoom(strength: strength, at: nw.center)
-                }
+                if strength > 0.08 { self.coordinator.injectWindowLoom(strength: strength, at: nw.center) }
             }
         }
-
-        // global mouse clicks = taps on the fly's substrate (mouse monitors are permission-free)
-        clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            guard let self else { return }
-            let loc = NSEvent.mouseLocation
-            self.coordinator.injectTap(at: CGPoint(x: loc.x - self.screenFrame.midX,
-                                                   y: loc.y - self.screenFrame.midY))
-        }
-
-        // if the current display disappears, retreat to the main screen
-        NotificationCenter.default.addObserver(
-            forName: NSApplication.didChangeScreenParametersNotification,
-            object: nil, queue: .main) { [weak self] _ in
-            guard let self else { return }
-            if !NSScreen.screens.contains(where: { $0.frame == self.screenFrame }),
-               let main = NSScreen.main {
-                self.move(to: main)
-            }
+        clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in self?.handleMissedSwing() }
+        challengeTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in self?.advanceGame() }
+        escapeTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.pollEscapeKey() }
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self, !NSScreen.screens.contains(where: { $0.frame == self.screenFrame }), let main = NSScreen.main else { return }
+            self.move(to: main)
         }
     }
+
+    private func updatePointerAndEnvironment() {
+        let loc = NSEvent.mouseLocation
+        swatterOverlay.move(to: loc)
+        coordinator.setMouse(CGPoint(x: loc.x - screenFrame.midX, y: loc.y - screenFrame.midY))
+        let keyIdle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown)
+        typingLevel += ((keyIdle < 0.6 ? 1.0 : 0.0) - typingLevel) * 0.15
+        let idle = userIdleSeconds(), now = Date()
+        let comps = Calendar.current.dateComponents([.hour, .minute], from: now)
+        let h = Double(comps.hour ?? 12) + Double(comps.minute ?? 0) / 60
+        let sleepy = (idle > 600 && (h >= 22 || h < 6)) || idle > 1800
+        coordinator.setAmbient(typing: typingLevel, sleepy: sleepy, tempo: thermalTempo(), activity: circadianActivity(hour: h))
+
+        hitWindow.update(at: loc, active: game.phase == .challenge && game.armed && sceneHitTest(global: loc))
+        if let snap = coordinator.flySnapshot(), snap.visible {
+            let pan = Float(clampf(snap.position.x / max(1, screenFrame.width / 2), -1, 1))
+            audio.setFlying(snap.flying && game.phase == .challenge, pan: pan)
+        } else { audio.setFlying(false, pan: 0) }
+    }
+
+    private func sceneHitTest(global: CGPoint) -> Bool {
+        let local = CGPoint(x: global.x - screenFrame.minX, y: global.y - screenFrame.minY)
+        let hits = scnView.hitTest(local, options: [SCNHitTestOption.searchMode: SCNHitTestSearchMode.all.rawValue])
+        return hits.contains { hit in
+            var node: SCNNode? = hit.node
+            while let n = node {
+                if n.name == "flyRoot" { return true }
+                node = n.parent
+            }
+            return false
+        }
+    }
+
+    private func armSwatter() {
+        game.arm(); swatterOverlay.arm()
+        giftWindow?.window?.orderOut(nil)
+    }
+
+    private func advanceGame() {
+        let now = ProcessInfo.processInfo.systemUptime
+        if game.shouldSpawn(now: now) {
+            game.spawn(now: now); coordinator.spawnGiftFly(); statusItem.button?.title = "🪰"
+            if game.armed { giftWindow?.window?.orderOut(nil) }
+            else if let screen = screenForCurrentFrame() { giftWindow?.collapseToTray(on: screen) }
+        }
+        guard game.phase == .challenge else { return }
+        let remaining = game.remaining(now: now)
+        if remaining <= 10, let screen = screenForCurrentFrame() {
+            countdownWindow.show(seconds: Int(ceil(remaining)), language: language, on: screen)
+            statusItem.button?.title = "🪰 \(Int(ceil(remaining)))"
+        }
+        if let result = game.tick(now: now) { finish(result) }
+    }
+
+    private func handleMissedSwing() {
+        guard game.phase == .challenge, game.armed else { return }
+        game.recordSwing(); swatterOverlay.swing(); audio.playSwing()
+        let loc = NSEvent.mouseLocation
+        coordinator.injectTap(at: CGPoint(x: loc.x - screenFrame.midX, y: loc.y - screenFrame.midY))
+    }
+
+    private func handleFlyClick() {
+        guard game.phase == .challenge, game.armed else { return }
+        game.recordSwing(); swatterOverlay.swing(); audio.playSwing()
+        guard let snap = coordinator.flySnapshot(), snap.visible else { return }
+        if snap.grounded, let result = game.kill(now: ProcessInfo.processInfo.systemUptime) {
+            finish(result, splatAt: sceneToGlobal(snap.position))
+        } else {
+            coordinator.injectTap(at: snap.position); coordinator.escapeTest()
+        }
+    }
+
+    private func finish(_ result: ChallengeResult, splatAt: CGPoint? = nil) {
+        countdownWindow.hide(); hitWindow.hide(); swatterOverlay.disarm()
+        audio.setFlying(false, pan: 0); coordinator.stopChallenge(); statusItem.button?.title = "🎁"
+        switch result {
+        case .killed:
+            coordinator.markFlyKilled(); audio.playHit()
+            if let splatAt { splatWindow = SplatWindowController(at: splatAt) }
+            revealTimer = Timer.scheduledTimer(withTimeInterval: 1.25, repeats: false) { [weak self] _ in self?.showResult(result) }
+        case .escaped:
+            coordinator.flyAway()
+            revealTimer = Timer.scheduledTimer(withTimeInterval: 1.25, repeats: false) { [weak self] _ in self?.showResult(result) }
+        case .cancelled:
+            cleanUpAndTerminate()
+        }
+    }
+
+    private func showResult(_ result: ChallengeResult) {
+        game.reveal(); splatWindow?.hide(); splatWindow = nil; giftWindow?.window?.orderOut(nil)
+        let wc = ResultWindowController(result: result, language: language) { [weak self] in self?.cleanUpAndTerminate() }
+        resultWindow = wc; wc.show()
+        revealTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: false) { [weak self] _ in self?.cleanUpAndTerminate() }
+    }
+
+    private func pollEscapeKey() {
+        let down = CGEventSource.keyState(.combinedSessionState, key: 53)
+        defer { lastEscapeDown = down }
+        guard down, !lastEscapeDown else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if escapeDetector.press(now: now), let result = game.cancel() { finish(result) }
+    }
+
+    private func sceneToGlobal(_ p: CGPoint) -> CGPoint { CGPoint(x: screenFrame.midX + p.x, y: screenFrame.midY + p.y) }
+    private func screenForCurrentFrame() -> NSScreen? { NSScreen.screens.first(where: { $0.frame == screenFrame }) ?? NSScreen.main }
 
     func move(to screen: NSScreen) {
-        screenFrame = screen.frame
-        window.setFrame(screen.frame, display: true)
-        scnView.frame = NSRect(origin: .zero, size: screen.frame.size)
-        coordinator.retarget(size: screen.frame.size)
-        brainWC?.move(to: screen)
-    }
-
-    @objc func moveToNextDisplay() {
-        let screens = NSScreen.screens
-        guard screens.count > 1 else { return }
-        let idx = screens.firstIndex(where: { $0.frame == screenFrame }) ?? 0
-        move(to: screens[(idx + 1) % screens.count])
+        screenFrame = screen.frame; window.setFrame(screen.frame, display: true)
+        scnView.frame = NSRect(origin: .zero, size: screen.frame.size); coordinator.retarget(size: screen.frame.size)
     }
 
     func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "🪰"
+        statusItem.button?.title = "🎁"
         let menu = NSMenu()
-        menu.addItem(withTitle: "Desktop Fly", action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: "FlyGift", action: nil, keyEquivalent: "")
         menu.addItem(withTitle: dataInfo, action: nil, keyEquivalent: "")
         menu.addItem(.separator())
         func item(_ title: String, _ sel: Selector, _ key: String) -> NSMenuItem {
-            let it = NSMenuItem(title: title, action: sel, keyEquivalent: key)
-            it.target = self
-            return it
+            let it = NSMenuItem(title: title, action: sel, keyEquivalent: key); it.target = self; return it
         }
-        menu.addItem(item("Pause", #selector(togglePause(_:)), "p"))
-        menu.addItem(item("Show/Hide Brain", #selector(toggleBrain), "b"))
-        menu.addItem(item("Escape Test (loom)", #selector(escapeTest), "e"))
-        let move = item("Move to Next Display", #selector(moveToNextDisplay), "d")
-        menu.addItem(move)
-        moveDisplayItem = move
-        menu.delegate = self
-        menu.addItem(item("Add Fly", #selector(addFly), "a"))
-        menu.addItem(item("Remove Fly", #selector(removeFly), "r"))
-        menu.addItem(item("Scare Flies", #selector(scareAll), "s"))
-        menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        menu.addItem(item("静音 / Mute", #selector(toggleMute(_:)), "m"))
+        menu.addItem(item("结束礼物 / End Gift", #selector(endGift), ""))
+        menu.addItem(.separator()); menu.addItem(item("Quit", #selector(endGift), "q"))
         statusItem.menu = menu
     }
 
-    @objc func togglePause(_ sender: NSMenuItem) {
-        paused.toggle()
-        scnView.isPlaying = !paused
-        coordinator.lastTime = nil
-        sender.title = paused ? "Resume" : "Pause"
+    @objc func toggleMute(_ sender: NSMenuItem) {
+        audio.setMuted(!audio.muted); sender.state = audio.muted ? .on : .off
     }
-    @objc func toggleBrain() {
-        guard let wc = brainWC else { return }
-        wc.isVisible ? wc.hide() : wc.show()
+    @objc func endGift() {
+        if let result = game.cancel() { finish(result) } else { cleanUpAndTerminate() }
     }
-    @objc func escapeTest() { coordinator.escapeTest() }
-    @objc func addFly() { coordinator.addFly() }
-    @objc func removeFly() { coordinator.removeFly() }
-    @objc func scareAll() { coordinator.scareAll() }
+    private func cleanUpAndTerminate() {
+        guard !didCleanUp else { return }
+        didCleanUp = true
+        game.terminate(); swatterOverlay.disarm(); hitWindow.hide(); countdownWindow.hide(); audio.stop(); NSApp.terminate(nil)
+    }
+    func applicationWillTerminate(_ notification: Notification) {
+        swatterOverlay.disarm(); hitWindow.hide(); countdownWindow.hide(); audio.stop()
+        if let clickMonitor { NSEvent.removeMonitor(clickMonitor) }
+        mouseTimer?.invalidate(); windowTimer?.invalidate(); challengeTimer?.invalidate(); escapeTimer?.invalidate(); revealTimer?.invalidate()
+    }
 }
 
 // MARK: - Entry point
@@ -1004,6 +1138,10 @@ if args.contains("--behaviortest") {
 }
 if let i = args.firstIndex(of: "--brainstats") {
     runBrainStats(seconds: args.count > i + 1 ? Int(args[i + 1]) ?? 5 : 5)
+}
+if args.contains("--gametest") {
+    runGameTest()
+    exit(0)
 }
 
 let app = NSApplication.shared

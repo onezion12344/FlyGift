@@ -2,20 +2,55 @@
   <img src="assets/fly.png" width="340" alt="SiliconFly — a 3D fruit fly">
 </p>
 
-<h1 align="center">SiliconFly 🪰</h1>
+<h1 align="center">FlyGift 🎁🪰</h1>
 
 <p align="center">
-A 3D fruit fly that lives on your macOS desktop, driven by a live spiking
-simulation of the <b>whole</b> <a href="https://codex.flywire.ai">FlyWire</a>
-brain — all 139,255 neurons, on the GPU, at 1 kHz. It walks across your windows,
-grooms, sleeps, and decides to flee your cursor with the same neurons a real fly
-uses.
+A mysterious macOS gift that opens into a 60-second fly-swatting challenge,
+powered by a live 1 kHz simulation of the <b>whole</b>
+<a href="https://codex.flywire.ai">FlyWire</a> connectome — 139,255 neurons on
+the Apple GPU.
 </p>
+
+## The gift
+
+FlyGift begins as a deliberately suspicious retro present. Open it, pick up the
+fly swatter, and wait. A procedural 3D fruit fly emerges after a random delay.
+Its approach response enters the real LC4/LPLC2 looming circuit; it takes off
+when the simulated DNp01 / Giant Fiber actually spikes. You have 60 seconds to
+catch it while it is grounded.
+
+- The first 50 seconds have no HUD; a countdown appears for the final 10.
+- Double-press `Esc`, use the menu-bar gift icon, or press `Cmd-Q` to quit.
+- The app is offline, has no analytics, and requests no Screen Recording or
+  Accessibility permission.
+- The reveal explains which parts are measured connectome data and which parts
+  remain computational modeling.
+
+The share page is designed for GitHub Pages. With `?from=NAME`, it presents a
+personalized but spoiler-free download page. Without the parameter it creates a
+shareable gift link.
+
+## Build FlyGift
+
+Requirements: Apple Silicon, macOS 15+, and Xcode Command Line Tools.
+
+```sh
+./build.sh
+open build/FlyGift.app
+```
+
+The build also produces `build/FlyGift-macOS-arm64.zip` and
+`build/SHA256SUMS.txt`. Run the headless game-flow checks with:
+
+```sh
+./FlyGift --gametest
+```
 
 <p align="center"><sub>
 Built on <a href="https://github.com/DenisSergeevitch/desktop-fly">DesktopFly</a> by Denis Shiryaev,
 which contributed the procedural fly body, the behaviour system and the desktop overlay.
-SiliconFly replaces its 668-neuron CPU circuit with the whole connectome on the GPU.
+FlyGift is based on <a href="https://github.com/dawsonamf/siliconfly">SiliconFly</a>,
+which replaced DesktopFly's 668-neuron CPU circuit with the whole connectome on the GPU.
 </sub></p>
 
 <p align="center">
@@ -116,32 +151,27 @@ No permissions or entitlements are required — everything it senses (cursor,
 window frames, clicks-as-taps, thermal state) is permission-free.
 
 ```sh
-git clone https://github.com/dawsonamf/siliconfly.git
-cd siliconfly
+git clone https://github.com/ThomasLin070217/FlyGift.git
+cd FlyGift
 ./build.sh
-./SiliconFly
+open build/FlyGift.app
 ```
 
-A 🪰 item appears in the menu bar; quit from there. The fly wanders your desktop
-on a transparent, click-through overlay — it never intercepts your mouse or
-keyboard.
+A gift item appears in the menu bar. The fly uses a transparent overlay, while
+a small geometry-matched hit window accepts clicks only over its rendered body;
+the rest of the desktop stays click-through.
 
 ## Controls (menu bar 🪰)
 
 | item | effect |
 |---|---|
-| Pause / Resume | freeze the world |
-| Show/Hide Brain | toggle the live brain window |
-| Escape Test (loom) | inject a looming stimulus, watch the GF fire |
-| Move to Next Display | hop the fly across monitors (shown when >1 display) |
-| Add / Remove Fly | extra flies (only fly #1 carries the brain) |
-| Scare Flies | startle everyone |
+| Mute | toggle all procedural audio |
+| End Gift | cleanly restore the cursor, stop audio, and quit |
+| Double `Esc` | immediately cancel from anywhere in the challenge |
 
-**The brain window is interactive**: hovering pauses the rotation; clicking
-"optogenetically" stimulates up to 400 somas within 0.6 world units of the click
-for 400 ms. The fly's reaction is whatever the real network does downstream —
-click the Giant Fiber and it escapes; click DNg11 and it grooms; click one side's
-DNa01/02 and it turns.
+The original connectome diagnostics remain available to developers through the
+command-line checks (`--simtest`, `--gpucheck`, `--behaviortest`, and
+`--brainshot`). They are not shown during the spoiler-free gift flow.
 
 ## How real neurons drive the body
 
