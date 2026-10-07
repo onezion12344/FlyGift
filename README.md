@@ -13,9 +13,12 @@ the Apple GPU.
 
 ## The gift
 
-FlyGift begins as a deliberately suspicious, fully rendered 3D present. Open
-the box, click the red Chinese-style plastic fly swatter to pick it up, and
-wait. A morphology-informed fruit fly emerges after a random delay.
+FlyGift begins as a deliberately suspicious, fully rendered 3D present. The
+opening shot uses ETechStudios' external CC0 gift-box mesh, with FlyGift's own
+physically based paper/ribbon materials, lighting, slow turn and unwrapping
+animation. Open it, then click the red Chinese-style plastic fly swatter itself
+to pick it up—there is no separate pickup button. A morphology-informed fruit
+fly emerges after a random delay.
 Its approach response enters the real LC4/LPLC2 looming circuit; it takes off
 when the simulated DNp01 / Giant Fiber actually spikes. You have 60 seconds to
 catch it while it is grounded.
@@ -23,10 +26,20 @@ catch it while it is grounded.
 - The first 50 seconds have no HUD; a countdown appears for the final 10.
 - The fly can cross between real desktop windows, land on their edges, hide
   beneath them, and rush toward the camera once during the challenge.
+- Flight is continuously integrated rather than played as a fixed point-to-point
+  clip: DNa steering, looming activity, escape drive and wing effort keep bending
+  speed, heading, altitude and landing timing while the fly is already airborne.
 - The visible body uses a dorsal *Drosophila* reference with red compound eyes,
   a tan thorax, segmented abdomen, translucent veined wings, and six fine legs.
-- Hits use the visible silhouette plus a small eight-point forgiveness margin,
-  so convincing contact counts without turning nearby clicks into hits.
+- The rendered 72×54 plastic swatter head—not just the cursor point—is used for
+  hit testing. Its position, angular size, approach velocity and swing pulse also
+  become the looming/air-puff stimulus presented to the fly.
+- Collision is swept across the full 220 ms swing rather than sampled only on
+  mouse-down. A 140 ms takeoff grace window resolves visible last-moment contact,
+  and every landing gets a brief 480 ms GF refractory opportunity.
+- A successful hit leaves an original macro-style insect residue for one beat,
+  then a cyan scan ring dissolves it into blue-and-gold luminous data particles:
+  the physical prank becomes the digital-life reveal.
 - Double-press `Esc`, use the menu-bar gift icon, or press `Cmd-Q` to quit.
 - The app is offline, has no analytics, and requests no Screen Recording or
   Accessibility permission.
@@ -36,6 +49,12 @@ catch it while it is grounded.
 The share page is designed for GitHub Pages. With `?from=NAME`, it presents a
 personalized but spoiler-free download page. Without the parameter it creates a
 shareable gift link.
+
+The packaged gift mesh is the
+[Gift Box 3D model by ETechStudios](https://etechstudios.itch.io/giftmodel),
+released under CC0. Its source and license notice are preserved in
+`assets/gift-box-cc0/README.md` and inside the App bundle. The splat image is an
+original generated asset, not a copied web photograph.
 
 ## Build FlyGift
 
@@ -52,6 +71,33 @@ The build also produces `build/FlyGift-macOS-arm64.zip` and
 ```sh
 ./FlyGift --gametest
 ```
+
+### macOS download and first launch
+
+Unzip the download, move `FlyGift.app` to Applications and double-click it.
+Preview builds have a complete ad-hoc bundle signature, verified before packaging,
+but are not Developer ID signed or Apple notarized. If macOS blocks launch because
+it cannot verify the developer, review the source and use the app-specific
+**System Settings → Privacy & Security → Open Anyway** option if offered.
+Control-click is not a reliable first-launch instruction on recent macOS versions.
+
+An **“app is damaged”** warning is a different failure. Download a fresh copy and
+compare its ZIP checksum with `SHA256SUMS.txt`. If it persists, report the exact
+message and macOS version rather than disabling Gatekeeper. A valid local signature
+and SHA-256 checksum establish integrity, not Apple trust or a malware review.
+
+For production distribution, install a Developer ID Application certificate and
+store notarization credentials in Keychain with `xcrun notarytool store-credentials`.
+Build with these environment variables (names only; no secrets belong in source):
+
+```sh
+FLYGIFT_SIGNING_IDENTITY='Developer ID Application: YOUR NAME (TEAMID)' \
+FLYGIFT_NOTARY_PROFILE='FlyGift-notary' ./build.sh
+```
+
+The build signs with hardened runtime, submits to Apple, staples the ticket,
+validates it and checks Gatekeeper before creating the final ZIP and checksum.
+Without those variables, it creates the explicitly unnotarized preview.
 
 <p align="center"><sub>
 Built on <a href="https://github.com/DenisSergeevitch/desktop-fly">DesktopFly</a> by Denis Shiryaev,

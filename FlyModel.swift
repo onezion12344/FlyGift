@@ -320,6 +320,14 @@ final class Fly {
     var flightTo = CGPoint.zero
     var flightT: CGFloat = 0
     var flightDur: CGFloat = 1
+    var flightAge: CGFloat = 0
+    var flightMinimum: CGFloat = 1.4
+    var flightMaximum: CGFloat = 5
+    var flightSpeed: CGFloat = 260
+    private var flightSaccadeTimer: CGFloat = 0
+    private var flightTurnImpulse: CGFloat = 0
+    private var flightLanding = false
+    private var flightEscapeHold: CGFloat = 0
     var flightEffort: CGFloat = 0.6   // set at takeoff: escape=1, casual from arousal
     var effortCurrent: CGFloat = 0.6  // live effort: base + ongoing DNp02/04/11 + arousal
     var alt: CGFloat = 0              // 0 ground .. 1 max altitude
@@ -329,6 +337,8 @@ final class Fly {
     private var brainLive = false
     private var liveArousal: CGFloat = 0
     private var liveWing: CGFloat = 0
+    private var liveTurn: CGFloat = 0
+    private var liveNervous: CGFloat = 0
     private var exitAfterFlight = false
     private(set) var isJumpscaring = false
     private var jumpscareNear = CGPoint.zero
@@ -392,8 +402,23 @@ final class Fly {
         }
         flightTo = target
         let dist = hypot(target.x - pos.x, target.y - pos.y)
-        flightDur = escape ? clampf(dist / 650, 0.45, 1.2) : clampf(dist / 420, 0.7, 2.0)
+        // A flight is no longer a one-shot interpolation to `flightTo`.
+        // These are a minimum commitment and a safety ceiling; the live brain,
+        // threat geometry and terrain decide what happens between them.
+        flightMinimum = escape ? clampf(1.15 + dist / 1_200, 1.25, 2.4)
+                               : clampf(1.55 + dist / 1_500, 1.7, 3.0)
+        flightMaximum = escape ? clampf(2.0 + dist / 260, 3.0, 6.5)
+                               : clampf(2.2 + dist / 220, 3.4, 8.0)
+        flightDur = flightMaximum
+        flightAge = 0
         flightT = 0
+        flightLanding = false
+        flightEscapeHold = escape ? 0.75 : 0
+        flightSaccadeTimer = rnd(0.16...0.44)
+        flightTurnImpulse = 0
+        flightSpeed = escape ? rnd(470...620) : rnd(245...370)
+        let desired = atan2(target.y - pos.y, target.x - pos.x)
+        heading += angleDiff(heading, desired) * (escape ? 0.72 : 0.42)
         scareCooldown = escape ? 2.0 : 2.5
         // wings stay visible and beat; blur discs add the motion-smear
         model.blurWingL.isHidden = false
@@ -417,13 +442,18 @@ final class Fly {
                            y: clampf(pos.y + rnd(-140...140), -bounds.height / 2, bounds.height / 2))
         flightT = 0
         flightDur = 1.05
+        flightAge = 0
         model.blurWingL.isHidden = false
         model.blurWingR.isHidden = false
     }
 
     func forceLandingSoon() {
         guard state == .flying, !exitAfterFlight else { return }
-        flightT = max(flightT, 0.98)
+        flightLanding = true
+        flightMinimum = 0
+        flightMaximum = min(flightMaximum, flightAge + 0.9)
+        flightTo = CGPoint(x: pos.x + cos(heading) * 90,
+                           y: pos.y + sin(heading) * 90)
     }
 
     func startJumpscare(bounds: CGSize) {
@@ -440,6 +470,7 @@ final class Fly {
                                y: rnd((-bounds.height / 2 + 80)...(bounds.height / 2 - 80)))
         }
         flightT = 0; flightDur = 1.18; flightEffort = 1.2; effortCurrent = 1.2
+        flightAge = 0
         flapPhase = 0; wingRaise = 0
     }
 
@@ -448,6 +479,7 @@ final class Fly {
         isHiding = true
         state = .idle
         speed = 0
+        flightLanding = false
         hideAge = 0
         hideHold = hold ?? rnd(1.1...2.8)
         hideOrigin = pos
@@ -491,6 +523,11 @@ final class Fly {
         isJumpscaring = false
         state = .idle
         stateTimer = rnd(0.3...0.8)
+        // A visible touchdown should be a real opportunity to swing. Without a
+        // brief refractory window, a swatter held near the landing point can
+        // drive GF on the very next render frame and make the fly appear
+        // impossible to hit despite having visibly landed.
+        scareCooldown = max(scareCooldown, 0.48)
         speed = 0
         alt = 0
         pitch = 0
@@ -540,6 +577,8 @@ final class Fly {
         brainLive = signals != nil
         liveArousal = signals?.arousal ?? 0
         liveWing = signals?.wingDrive ?? 0
+        liveTurn = signals?.turnBias ?? 0
+        liveNervous = signals?.nervous ?? 0
 
         if isHiding {
             // Hiding never masks the real emergency pathway: a Giant Fiber
@@ -556,7 +595,19 @@ final class Fly {
         }
 
         if state == .flying {
-            updateFlight(dt: dt)
+            flightEscapeHold = max(0, flightEscapeHold - dt)
+            if let s = signals, s.escape, flightEscapeHold <= 0.05 {
+                flightEscapeHold = 0.85
+                flightLanding = false
+                flightMinimum = max(flightMinimum, flightAge + 0.8)
+                if let m = mouse {
+                    let away = atan2(pos.y - m.y, pos.x - m.x)
+                    flightTo = CGPoint(x: pos.x + cos(away) * rnd(360...620),
+                                       y: pos.y + sin(away) * rnd(360...620))
+                    flightTurnImpulse += angleDiff(heading, away) * 0.8
+                }
+            }
+            updateFlight(dt: dt, bounds: bounds, threat: mouse)
         } else if let s = signals {
             brainBehavior(s, dt: dt, bounds: bounds, mouse: mouse)
             if state == .walking { updateWalk(dt: dt, bounds: bounds) }
@@ -725,52 +776,113 @@ final class Fly {
         node.position = p
     }
 
-    private func updateFlight(dt: CGFloat) {
-        flightT = min(1, flightT + dt / flightDur)
+    private func updateFlight(dt: CGFloat, bounds: CGSize, threat: CGPoint?) {
         if isJumpscaring {
+            flightT = min(1, flightT + dt / flightDur)
             updateJumpscareFlight()
             return
         }
-        if flightT >= 1 {
-            if exitAfterFlight {
+        if exitAfterFlight {
+            flightT = min(1, flightT + dt / flightDur)
+            if flightT >= 1 {
                 pos = flightTo
                 alt = 1
                 node.isHidden = true
                 syncNode()
                 return
             }
-            // touchdown flare: the timer ended, but the fly lands only when it
-            // has actually descended — hover over the target and settle down.
-            pos.x = flightTo.x + sin(time * 26) * 1.2
-            pos.y = flightTo.y + cos(time * 22) * 1.0
-            pitch = clampf(alt * 0.4, 0, 0.35)   // gentle nose-up flare
-            alt += (0 - alt) * min(1, 9 * dt)
+            let e = smoothstep(flightT)
+            pos.x = flightFrom.x + (flightTo.x - flightFrom.x) * e
+            pos.y = flightFrom.y + (flightTo.y - flightFrom.y) * e
+            heading = atan2(flightTo.y - flightFrom.y, flightTo.x - flightFrom.x)
+            alt += (1 - alt) * min(1, 8 * dt)
             applyAltitude()
-            if alt < 0.035 { pos = flightTo; land() }
             return
         }
-        let e = smoothstep(flightT)
-        let dx = flightTo.x - flightFrom.x, dy = flightTo.y - flightFrom.y
-        let len = max(1, hypot(dx, dy))
-        let px = -dy / len, py = dx / len
-        let wob = sin(time * 32) * 4 * sin(flightT * .pi)
-        pos.x = flightFrom.x + dx * e + px * wob
-        pos.y = flightFrom.y + dy * e + py * wob
-        heading = atan2(dy, dx) + sin(time * 18) * 0.12
-        // altitude: climb, effort-scaled cruise with buzz-wobble, descend to land.
-        // Effort stays live: ongoing escape-DN (DNp02/04/11) and arousal activity
-        // pushes the fly to beat harder and fly higher mid-flight.
+
+        flightAge += dt
+        flightT = min(1, flightAge / max(0.1, flightMaximum))
         effortCurrent = brainLive
             ? clampf(max(flightEffort,
                          flightEffort * 0.55 + liveArousal * 0.25 + liveWing * 0.6), 0.25, 1.3)
             : flightEffort
-        let riseEnv = min(flightT / 0.25, 1)
-        let fallEnv = min((1 - flightT) / 0.3, 1)
-        let target = effortCurrent * min(riseEnv, fallEnv) * (0.85 + 0.15 * sin(time * 7))
-        pitch = clampf((target - alt) * 2.5, -0.45, 0.45)   // nose up while climbing
-        alt += (target - alt) * min(1, 6 * dt)
-        // higher = closer to the viewer = bigger, and the shadow slides away
+
+        let hw = bounds.width / 2 - EDGE_MARGIN
+        let hh = bounds.height / 2 - EDGE_MARGIN
+        flightTo.x = clampf(flightTo.x, -hw, hw)
+        flightTo.y = clampf(flightTo.y, -hh, hh)
+        var dx = flightTo.x - pos.x
+        var dy = flightTo.y - pos.y
+        var distance = max(1, hypot(dx, dy))
+
+        // Reaching a waypoint is not an automatic landing. Under arousal the
+        // fly chains another leg, producing a continuous path instead of the
+        // old fly-stop-turn cadence.
+        if !flightLanding, distance < 72,
+           (flightAge < flightMinimum || flightEscapeHold > 0 || liveNervous > 0.34) {
+            let bend = rnd(-1.05...1.05) + liveTurn * 0.8
+            let leg = rnd(260...520)
+            flightTo = CGPoint(x: clampf(pos.x + cos(heading + bend) * leg, -hw, hw),
+                               y: clampf(pos.y + sin(heading + bend) * leg, -hh, hh))
+            dx = flightTo.x - pos.x; dy = flightTo.y - pos.y
+            distance = max(1, hypot(dx, dy))
+        }
+
+        let calmEnough = liveNervous < 0.28 && flightEscapeHold <= 0
+        if !flightLanding, flightAge >= flightMinimum, distance < 86, calmEnough {
+            flightLanding = true
+        } else if !flightLanding, flightAge >= flightMaximum {
+            flightLanding = true
+            flightTo = CGPoint(x: clampf(pos.x + cos(heading) * 105, -hw, hw),
+                               y: clampf(pos.y + sin(heading) * 105, -hh, hh))
+            dx = flightTo.x - pos.x; dy = flightTo.y - pos.y
+            distance = max(1, hypot(dx, dy))
+        }
+
+        flightSaccadeTimer -= dt
+        if flightSaccadeTimer <= 0, !flightLanding {
+            let energy = clampf(liveNervous * 0.75 + liveArousal * 0.2 + liveWing * 0.2, 0, 1)
+            flightTurnImpulse += rnd(-1...1) * (0.10 + energy * 0.72)
+            flightSaccadeTimer = rnd(0.16...0.42) + (1 - energy) * rnd(0.08...0.28)
+        }
+        flightTurnImpulse *= exp(-(flightLanding ? 10 : 4.5) * dt)
+
+        var desiredHeading = atan2(dy, dx)
+        if !flightLanding { desiredHeading += liveTurn * (0.45 + liveNervous * 0.65) }
+        if let threat, !flightLanding {
+            let tx = pos.x - threat.x, ty = pos.y - threat.y
+            let threatDistance = max(1, hypot(tx, ty))
+            let avoidance = clampf(1 - threatDistance / 340, 0, 1)
+                * clampf(0.25 + liveNervous + flightEscapeHold, 0, 1.5)
+            let away = atan2(ty, tx)
+            desiredHeading += angleDiff(desiredHeading, away) * avoidance
+        }
+        desiredHeading += flightTurnImpulse
+        let turnRate = flightLanding ? 10
+            : 2.8 + liveNervous * 5.2 + (flightEscapeHold > 0 ? 3.5 : 0)
+        heading += clampf(angleDiff(heading, desiredHeading), -turnRate * dt, turnRate * dt)
+
+        let cruise = 210 + effortCurrent * 245 + liveNervous * 150
+            + (flightEscapeHold > 0 ? 150 : 0)
+        let desiredSpeed = flightLanding ? clampf(distance * 2.8, 18, 210) : cruise
+        flightSpeed += (desiredSpeed - flightSpeed) * min(1, (flightLanding ? 4.8 : 2.7) * dt)
+        let microWobble = sin(time * 31) * (1.8 + liveNervous * 3.0)
+        pos.x += (cos(heading) * flightSpeed - sin(heading) * microWobble) * dt
+        pos.y += (sin(heading) * flightSpeed + cos(heading) * microWobble) * dt
+        pos.x = clampf(pos.x, -hw, hw); pos.y = clampf(pos.y, -hh, hh)
+
+        let landingProgress = flightLanding ? clampf(1 - distance / 150, 0, 1) : 0
+        let cruiseAltitude = clampf(0.48 + effortCurrent * 0.47
+                                    + 0.05 * sin(time * 7), 0.35, 1.05)
+        let targetAltitude = cruiseAltitude * (1 - landingProgress)
+        pitch = clampf((targetAltitude - alt) * 2.5, -0.45, 0.45)
+        alt += (targetAltitude - alt) * min(1, (flightLanding ? 7.5 : 5.2) * dt)
         applyAltitude()
+
+        if flightLanding, distance < 24, alt < 0.055 {
+            pos = flightTo
+            land()
+        }
     }
 
     private func updateJumpscareFlight() {

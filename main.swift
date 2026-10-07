@@ -131,6 +131,16 @@ func runSnapshot(path: String) {
     offscreenRender(scene, camNode: camNode, size: CGSize(width: 720, height: 720), path: path)
 }
 
+func runGiftshot(path: String) {
+    let view = GiftBox3DView(frame: NSRect(x: 0, y: 0, width: 660, height: 490))
+    guard let scene = view.scene,
+          let camera = scene.rootNode.childNodes.first(where: { $0.camera != nil }) else {
+        fputs("giftshot: scene or camera unavailable\n", stderr); exit(1)
+    }
+    scene.background.contents = NSColor(calibratedRed: 0.91, green: 0.81, blue: 0.62, alpha: 1)
+    offscreenRender(scene, camNode: camera, size: CGSize(width: 660, height: 490), path: path)
+}
+
 func runBrainshot(path: String) {
     guard let c = loadConnectome(),
           let sim = MetalSim(connectome: c, spikeBus: nil, seed: SIM_SEED) else {
@@ -522,6 +532,38 @@ func runBehaviorTest() {
         return (hi - lo > 0.25, String(format: "wing sweep %.2f rad over 0.5 s", hi - lo))
     }
 
+    bodyCheck("flight: reaches a waypoint without stop-and-restart") {
+        let fly = Fly(at: .zero)
+        fly.heading = 0
+        fly.startFlight(bounds: bounds, effort: 0.7)
+        fly.flightTo = CGPoint(x: 45, y: 0)
+        fly.flightMinimum = 3.0
+        var maxStep: CGFloat = 0
+        var previous = fly.pos
+        for _ in 0..<120 where fly.state == .flying {
+            var active = BrainSignals(); active.arousal = 0.35; active.nervous = 0.25
+            fly.update(dt: dt, bounds: bounds, mouse: nil, signals: active)
+            maxStep = max(maxStep, hypot(fly.pos.x - previous.x, fly.pos.y - previous.y))
+            previous = fly.pos
+        }
+        return (fly.state == .flying && hypot(fly.pos.x, fly.pos.y) > 180 && maxStep < 14,
+                String(format: "state %@, travelled %.0f pt, max frame step %.1f",
+                       "\(fly.state)", hypot(fly.pos.x, fly.pos.y), maxStep))
+    }
+
+    bodyCheck("flight: live DNa steering bends the path mid-air") {
+        let fly = Fly(at: .zero)
+        fly.heading = 0
+        fly.startFlight(bounds: bounds, effort: 0.75)
+        fly.flightTo = CGPoint(x: 650, y: 0)
+        fly.flightMinimum = 4
+        let initial = fly.heading
+        var turn = BrainSignals(); turn.turnBias = 1; turn.arousal = 0.35
+        for _ in 0..<55 { fly.update(dt: dt, bounds: bounds, mouse: nil, signals: turn) }
+        return (fly.state == .flying && fly.heading - initial > 0.18 && fly.pos.y > 5,
+                String(format: "heading Δ%+.2f rad, y %.0f", fly.heading - initial, fly.pos.y))
+    }
+
     bodyCheck("escape-DN activity mid-flight raises wing-beat effort") {
         let fly = Fly(at: .zero)
         fly.state = .idle
@@ -640,6 +682,8 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
     var flies: [Fly] = []
     var lastTime: TimeInterval?
     var mouseScene: CGPoint?
+    private var threatRadius: CGFloat = 6
+    private var threatSwing: CGFloat = 0
     private let lock = NSLock()
     private var pending: [(Coordinator) -> Void] = []
 
@@ -737,7 +781,14 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
         }
     }
     func escapeTest() { enqueue { $0.loomOverride = 0.6 } }
-    func setMouse(_ p: CGPoint?) { lock.lock(); mouseScene = p; lock.unlock() }
+    func setMouse(_ p: CGPoint?) { setThreat(p, radius: 6, swing: 0) }
+    func setThreat(_ p: CGPoint?, radius: CGFloat, swing: CGFloat) {
+        lock.lock()
+        mouseScene = p
+        threatRadius = radius
+        threatSwing = swing
+        lock.unlock()
+    }
 
     func setTerrain(_ ledges: [Ledge], windows: [WindowRegion] = []) {
         enqueue { c in c.terrain = ledges; c.windowRegions = windows }
@@ -803,7 +854,8 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
     // Cursor kinematics -> looming drive for each eye of fly #1 + air puff.
     // This is the sensory transduction step; everything downstream of the
     // LC4/LPLC2 population is the real connectome.
-    private func computeLoom(fly: Fly, mouse: CGPoint?, dt: CGFloat) -> (l: Float, r: Float, puff: Float) {
+    private func computeLoom(fly: Fly, mouse: CGPoint?, radius: CGFloat,
+                             swing: CGFloat, dt: CGFloat) -> (l: Float, r: Float, puff: Float) {
         guard let m = mouse else { return (0, 0, 0) }
         if let pm = prevMouse, dt > 0 {
             let v = CGPoint(x: (m.x - pm.x) / dt, y: (m.y - pm.y) / dt)
@@ -812,12 +864,18 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
         }
         prevMouse = m
         let rel = CGPoint(x: m.x - fly.pos.x, y: m.y - fly.pos.y)
-        let dist = max(20, hypot(rel.x, rel.y))
+        let dist = max(radius + 8, hypot(rel.x, rel.y))
         // radial approach speed (positive = cursor closing in)
         let approach = -(rel.x * mouseVel.x + rel.y * mouseVel.y) / dist
-        // loom ~ rate of angular expansion, attenuated with distance
-        var loom = clampf(approach / dist * 6, 0, 1) * clampf(1 - dist / 800, 0, 1)
-        loom += clampf((130 - dist) / 130, 0, 1) * 0.5          // hovering close = big object
+        // Retinal angular expansion of a finite object. A bare pointer is a
+        // tiny stimulus; the armed 72x54 swatter head subtends a much larger
+        // angle and its swing contributes an additional fast looming pulse.
+        let angularExpansion = max(0, approach) * radius
+            / max(1, dist * dist + radius * radius)
+        let nearRange = 42 + radius * 2.7
+        var loom = clampf(angularExpansion * 1.45, 0, 1)
+        loom += clampf((nearRange - dist) / nearRange, 0, 1) * 0.42
+        loom += swing * clampf(1 - dist / 360, 0, 1) * 0.34
         loom = clampf(loom + loomOverride, 0, 1)
         // split between eyes by bearing relative to heading
         let f = CGPoint(x: cos(fly.heading), y: sin(fly.heading))
@@ -825,7 +883,8 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
         let crossZ = f.x * rd.y - f.y * rd.x                     // >0: threat on the left
         let lw = clampf(0.5 + 0.5 * crossZ, 0.12, 1)
         let rw = clampf(0.5 - 0.5 * crossZ, 0.12, 1)
-        let puff = clampf(hypot(mouseVel.x, mouseVel.y) / 1500, 0, 1) * clampf(1 - dist / 500, 0, 1)
+        let puff = clampf(hypot(mouseVel.x, mouseVel.y) / 1300 + swing * 0.65, 0, 1)
+            * clampf(1 - dist / (460 + radius * 2), 0, 1)
         return (Float(loom * lw), Float(loom * rw), Float(puff))
     }
 
@@ -842,6 +901,8 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
         lock.lock()
         let actions = pending; pending.removeAll()
         let mouse = mouseScene
+        let sensedRadius = threatRadius
+        let sensedSwing = threatSwing
         lock.unlock()
         for a in actions { a(self) }
 
@@ -851,7 +912,8 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
 
         var signals: BrainSignals? = nil
         if let sim = sim, let first = flies.first {
-            let sensory = computeLoom(fly: first, mouse: mouse, dt: dt)
+            let sensory = computeLoom(fly: first, mouse: mouse, radius: sensedRadius,
+                                      swing: sensedSwing, dt: dt)
             let decayF = Float(exp(-4 * Double(dt)))
             windowLoomL *= decayF
             windowLoomR *= decayF
@@ -957,6 +1019,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var lastEscapeDown = false
     var escapeDetector = DoublePressDetector()
     var didCleanUp = false
+    var activeSwing = false
+    var swingContactHandled = false
+    var previousSwingHead: SwatterHeadSample?
+    var lastGroundedAt: TimeInterval = -.greatestFiniteMagnitude
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard let screen = NSScreen.main else { fatalError("no screen") }
@@ -1002,7 +1068,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         wc.onArm = { [weak self] in self?.armSwatter() }
         wc.onLanguageChange = { [weak self] lang in self?.language = lang }
         giftWindow = wc
-        hitWindow.onClick = { [weak self] in self?.handleFlyClick() }
+        hitWindow.onClick = { [weak self] in self?.beginSwing() }
     }
 
     private func setupInputAndTimers() {
@@ -1020,8 +1086,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in
             guard let self else { return }
-            if self.isCursorOnFly(global: NSEvent.mouseLocation) { self.handleFlyClick() }
-            else { self.handleMissedSwing() }
+            self.beginSwing()
         }
         challengeTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in self?.advanceGame() }
         escapeTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.pollEscapeKey() }
@@ -1034,7 +1099,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updatePointerAndEnvironment() {
         let loc = NSEvent.mouseLocation
         swatterOverlay.move(to: loc)
-        coordinator.setMouse(CGPoint(x: loc.x - screenFrame.midX, y: loc.y - screenFrame.midY))
+        let head = swatterOverlay.headSample(at: loc)
+        let sensed = head?.center ?? loc
+        coordinator.setThreat(CGPoint(x: sensed.x - screenFrame.midX,
+                                      y: sensed.y - screenFrame.midY),
+                              radius: head?.equivalentRadius ?? 6,
+                              swing: head?.swing ?? 0)
         let keyIdle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown)
         typingLevel += ((keyIdle < 0.6 ? 1.0 : 0.0) - typingLevel) * 0.15
         let idle = userIdleSeconds(), now = Date()
@@ -1043,8 +1113,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let sleepy = (idle > 600 && (h >= 22 || h < 6)) || idle > 1800
         coordinator.setAmbient(typing: typingLevel, sleepy: sleepy, tempo: thermalTempo(), activity: circadianActivity(hour: h))
 
+        let snap = coordinator.flySnapshot()
+        let uptime = ProcessInfo.processInfo.systemUptime
+        if snap?.grounded == true { lastGroundedAt = uptime }
+        if activeSwing {
+            if let head, swatterOverlay.isSwinging, let snap {
+                evaluateSwing(head: sceneHead(head), snapshot: snap, now: uptime)
+            } else if !swatterOverlay.isSwinging {
+                activeSwing = false; previousSwingHead = nil
+            }
+        }
+
         hitWindow.update(at: loc, active: game.phase == .challenge && game.armed && isCursorOnFly(global: loc))
-        if let snap = coordinator.flySnapshot(), snap.visible {
+        if let snap, snap.visible {
             let pan = Float(clampf(snap.position.x / max(1, screenFrame.width / 2), -1, 1))
             audio.setFlying(snap.flying && game.phase == .challenge, pan: pan,
                             close: snap.jumpscaring)
@@ -1053,6 +1134,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func isCursorOnFly(global: CGPoint) -> Bool {
         guard let snap = coordinator.flySnapshot(), snap.visible else { return false }
+        if let head = swatterOverlay.headSample(at: global) {
+            let sceneHead = sceneHead(head)
+            return swatterHeadHitTest(flyCenter: snap.position, flyRadius: snap.radius,
+                                      head: sceneHead)
+        }
         let scene = CGPoint(x: global.x - screenFrame.midX, y: global.y - screenFrame.midY)
         return flyHitTest(cursor: scene, center: snap.position, visualRadius: snap.radius)
     }
@@ -1060,6 +1146,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func armSwatter() {
         game.arm(); swatterOverlay.arm()
         giftWindow?.window?.orderOut(nil)
+    }
+
+    private func sceneHead(_ head: SwatterHeadSample) -> SwatterHeadSample {
+        SwatterHeadSample(center: CGPoint(x: head.center.x - screenFrame.midX,
+                                          y: head.center.y - screenFrame.midY),
+                          size: head.size, angle: head.angle, swing: head.swing)
     }
 
     private func advanceGame() {
@@ -1079,18 +1171,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let result = game.tick(now: now) { finish(result) }
     }
 
-    private func handleMissedSwing() {
+    private func beginSwing() {
         guard game.phase == .challenge, game.armed else { return }
-        game.recordSwing(); swatterOverlay.swing(); audio.playSwing()
+        game.recordSwing()
+        activeSwing = true
+        swingContactHandled = false
+        previousSwingHead = swatterOverlay.headSample(at: NSEvent.mouseLocation).map(sceneHead)
+        swatterOverlay.swing(); audio.playSwing()
         let loc = NSEvent.mouseLocation
-        coordinator.injectTap(at: CGPoint(x: loc.x - screenFrame.midX, y: loc.y - screenFrame.midY))
+        let impact = swatterOverlay.headSample(at: loc)?.center ?? loc
+        coordinator.injectTap(at: CGPoint(x: impact.x - screenFrame.midX,
+                                          y: impact.y - screenFrame.midY))
     }
 
-    private func handleFlyClick() {
-        guard game.phase == .challenge, game.armed else { return }
-        game.recordSwing(); swatterOverlay.swing(); audio.playSwing()
-        guard let snap = coordinator.flySnapshot(), snap.visible else { return }
-        if snap.grounded, let result = game.kill(now: ProcessInfo.processInfo.systemUptime) {
+    private func evaluateSwing(head: SwatterHeadSample, snapshot snap: FlySnapshot,
+                               now: TimeInterval) {
+        guard activeSwing, !swingContactHandled, game.phase == .challenge,
+              snap.visible else { previousSwingHead = head; return }
+        let previous = previousSwingHead ?? head
+        previousSwingHead = head
+        guard sweptSwatterHeadHitTest(flyCenter: snap.position, flyRadius: snap.radius,
+                                      from: previous, to: head) else { return }
+        swingContactHandled = true
+        activeSwing = false
+        let caughtDuringTakeoff = !snap.grounded && now - lastGroundedAt <= 0.14
+        if snap.grounded || caughtDuringTakeoff,
+           let result = game.kill(now: now) {
             finish(result, splatAt: sceneToGlobal(snap.position))
         } else {
             coordinator.injectTap(at: snap.position); coordinator.escapeTest()
@@ -1098,13 +1204,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func finish(_ result: ChallengeResult, splatAt: CGPoint? = nil) {
+        activeSwing = false; previousSwingHead = nil
         countdownWindow.hide(); hitWindow.hide(); swatterOverlay.disarm()
         audio.setFlying(false, pan: 0); coordinator.stopChallenge(); statusItem.button?.title = "🎁"
         switch result {
         case .killed:
             coordinator.markFlyKilled(); audio.playHit()
             if let splatAt { splatWindow = SplatWindowController(at: splatAt) }
-            revealTimer = Timer.scheduledTimer(withTimeInterval: 1.25, repeats: false) { [weak self] _ in self?.showResult(result) }
+            // Let the physical residue register, then dissolve into the blue/gold
+            // particle signature of a simulated organism before the science reveal.
+            revealTimer = Timer.scheduledTimer(withTimeInterval: 1.65, repeats: false) { [weak self] _ in self?.showResult(result) }
         case .escaped:
             coordinator.flyAway()
             revealTimer = Timer.scheduledTimer(withTimeInterval: 1.25, repeats: false) { [weak self] _ in self?.showResult(result) }
@@ -1175,6 +1284,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 let args = CommandLine.arguments
 if let i = args.firstIndex(of: "--snapshot") {
     runSnapshot(path: args.count > i + 1 ? args[i + 1] : "preview.png")
+    exit(0)
+}
+if let i = args.firstIndex(of: "--giftshot") {
+    runGiftshot(path: args.count > i + 1 ? args[i + 1] : "gift.png")
     exit(0)
 }
 if let i = args.firstIndex(of: "--brainshot") {

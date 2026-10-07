@@ -19,7 +19,7 @@ struct GiftCopy {
     var giftTitle: String { language == .zh ? "一份给你的礼物" : "A gift for you" }
     var giftBody: String { language == .zh ? "听说你最近缺一个真正实用的东西。" : "We heard you could use something truly practical." }
     var open: String { language == .zh ? "拆开看看" : "Open it" }
-    var won: String { language == .zh ? "恭喜，你获得了：" : "Congratulations. You received:" }
+    var won: String { language == .zh ? "点一下，拿起苍蝇拍。" : "Click the swatter to pick it up." }
     var swatter: String { language == .zh ? "苍蝇拍" : "A fly swatter" }
     var arm: String { language == .zh ? "点击拿起 · 可能马上用得上" : "Pick it up · You may need it soon" }
     var tray: String { language == .zh ? "拿起苍蝇拍" : "Pick up the swatter" }
@@ -75,6 +75,50 @@ struct DoublePressDetector {
 func flyHitTest(cursor: CGPoint, center: CGPoint, visualRadius: CGFloat,
                 forgiveness: CGFloat = 8) -> Bool {
     hypot(cursor.x - center.x, cursor.y - center.y) <= visualRadius + forgiveness
+}
+
+struct SwatterHeadSample {
+    let center: CGPoint
+    let size: CGSize
+    let angle: CGFloat
+    let swing: CGFloat
+
+    var equivalentRadius: CGFloat {
+        sqrt(size.width * size.height / .pi)
+    }
+}
+
+func swatterHeadHitTest(flyCenter: CGPoint, flyRadius: CGFloat,
+                        head: SwatterHeadSample, forgiveness: CGFloat = 9) -> Bool {
+    let dx = flyCenter.x - head.center.x
+    let dy = flyCenter.y - head.center.y
+    let c = cos(-head.angle), s = sin(-head.angle)
+    let localX = dx * c - dy * s
+    let localY = dx * s + dy * c
+    let qx = max(abs(localX) - head.size.width * 0.5, 0)
+    let qy = max(abs(localY) - head.size.height * 0.5, 0)
+    return hypot(qx, qy) <= flyRadius + forgiveness
+}
+
+func sweptSwatterHeadHitTest(flyCenter: CGPoint, flyRadius: CGFloat,
+                             from: SwatterHeadSample, to: SwatterHeadSample) -> Bool {
+    let travel = hypot(to.center.x - from.center.x, to.center.y - from.center.y)
+    let angleDelta = atan2(sin(to.angle - from.angle), cos(to.angle - from.angle))
+    let steps = max(1, min(18, Int(ceil(max(travel / 7, abs(angleDelta) / 0.08)))))
+    for index in 0...steps {
+        let t = CGFloat(index) / CGFloat(steps)
+        let sample = SwatterHeadSample(
+            center: CGPoint(x: from.center.x + (to.center.x - from.center.x) * t,
+                            y: from.center.y + (to.center.y - from.center.y) * t),
+            size: CGSize(width: from.size.width + (to.size.width - from.size.width) * t,
+                         height: from.size.height + (to.size.height - from.size.height) * t),
+            angle: from.angle + angleDelta * t,
+            swing: from.swing + (to.swing - from.swing) * t)
+        if swatterHeadHitTest(flyCenter: flyCenter, flyRadius: flyRadius, head: sample) {
+            return true
+        }
+    }
+    return false
 }
 
 final class ChallengeController {
@@ -155,6 +199,7 @@ final class RetroPaperView: NSView {
 
 final class SwatterGraphicView: NSView {
     var swing: CGFloat = 0 { didSet { needsDisplay = true } }
+    var onClick: (() -> Void)? { didSet { window?.invalidateCursorRects(for: self) } }
     private lazy var swatterImage: NSImage? = {
         guard let url = findResource("swatter-red-v3.png")
                 ?? findResource("assets/swatter-red-v3.png") else { return nil }
@@ -224,12 +269,20 @@ final class SwatterGraphicView: NSView {
         }
         NSGraphicsContext.current?.restoreGraphicsState()
     }
+
+    override func mouseDown(with event: NSEvent) { onClick?() }
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if onClick != nil { addCursorRect(bounds, cursor: .pointingHand) }
+    }
 }
 
 final class GiftBox3DView: SCNView {
     var onOpen: (() -> Void)?
     private let giftRoot = SCNNode()
-    private let lid = SCNNode()
+    private let modelRoot = SCNNode()
+    private var wrappingNodes: [SCNNode] = []
+    private var boxNodes: [SCNNode] = []
     private var opened = false
 
     override init(frame: NSRect, options: [String: Any]? = nil) {
@@ -245,68 +298,121 @@ final class GiftBox3DView: SCNView {
         antialiasingMode = .multisampling4X
         allowsCameraControl = false
 
-        let red = SCNMaterial(); red.lightingModel = .physicallyBased
-        red.diffuse.contents = NSColor(calibratedRed: 0.50, green: 0.025, blue: 0.02, alpha: 1)
-        red.roughness.contents = 0.38; red.metalness.contents = 0.03
-        let gold = SCNMaterial(); gold.lightingModel = .physicallyBased
-        gold.diffuse.contents = NSColor(calibratedRed: 0.92, green: 0.63, blue: 0.12, alpha: 1)
-        gold.roughness.contents = 0.28; gold.metalness.contents = 0.42
+        let paper = SCNMaterial(); paper.lightingModel = .physicallyBased
+        paper.diffuse.contents = NSColor(calibratedRed: 0.70, green: 0.035, blue: 0.035, alpha: 1)
+        paper.roughness.contents = 0.48; paper.metalness.contents = 0.01
+        let ribbon = SCNMaterial(); ribbon.lightingModel = .physicallyBased
+        ribbon.diffuse.contents = NSColor(calibratedRed: 0.98, green: 0.64, blue: 0.09, alpha: 1)
+        ribbon.roughness.contents = 0.19; ribbon.metalness.contents = 0.22
 
-        func box(_ width: CGFloat, _ height: CGFloat, _ length: CGFloat,
-                 material: SCNMaterial, bevel: CGFloat) -> SCNNode {
-            let geometry = SCNBox(width: width, height: height, length: length, chamferRadius: bevel)
-            geometry.materials = [material]
-            return SCNNode(geometry: geometry)
+        if let url = findResource("GiftBox.obj") ?? findResource("assets/gift-box-cc0/GiftBox.obj"),
+           let imported = try? SCNScene(url: url, options: [
+               .checkConsistency: true,
+               .convertToYUp: true,
+               .createNormalsIfAbsent: true
+           ]) {
+            for child in imported.rootNode.childNodes { modelRoot.addChildNode(child.clone()) }
+        } else {
+            // The packaged CC0 mesh is the normal path; this keeps source-tree
+            // developer runs understandable if Resources have not been copied.
+            let fallback = SCNBox(width: 1.5, height: 1.35, length: 1.5, chamferRadius: 0.05)
+            fallback.materials = [paper]
+            let node = SCNNode(geometry: fallback); node.name = "GiftBox_fallback"
+            modelRoot.addChildNode(node)
         }
 
-        let base = box(116, 72, 86, material: red, bevel: 5)
-        base.position.y = -18; base.castsShadow = true
-        giftRoot.addChildNode(base)
-        let bandFront = box(17, 74, 88, material: gold, bevel: 1.5)
-        bandFront.position.y = -17; giftRoot.addChildNode(bandFront)
-        let bandCross = box(118, 74, 15, material: gold, bevel: 1.5)
-        bandCross.position.y = -17; giftRoot.addChildNode(bandCross)
-
-        let lidTop = box(126, 16, 96, material: red, bevel: 5)
-        lidTop.castsShadow = true; lid.addChildNode(lidTop)
-        let lidBandA = box(18, 17.5, 98, material: gold, bevel: 1.2); lid.addChildNode(lidBandA)
-        let lidBandB = box(128, 17.5, 16, material: gold, bevel: 1.2); lid.addChildNode(lidBandB)
-        lid.position.y = 26
-
-        for side in [-1.0, 1.0] {
-            let torus = SCNTorus(ringRadius: 13, pipeRadius: 3.2)
-            torus.materials = [gold]
-            let loop = SCNNode(geometry: torus)
-            loop.position = SCNVector3(CGFloat(side) * 12, 15, 0)
-            loop.scale = SCNVector3(1.15, 0.62, 0.72)
-            loop.eulerAngles.z = CGFloat(side) * 0.30
-            lid.addChildNode(loop)
+        func prepare(_ node: SCNNode) {
+            let lower = (node.name ?? "").lowercased()
+            if let geometry = node.geometry {
+                // SceneKit collapses the OBJ objects into material elements.
+                // Re-split them so the bow and two ribbon meshes can unwrap
+                // independently from the paper box during the reveal.
+                if geometry.elements.count > 1 {
+                    node.geometry = nil
+                    for index in 0..<geometry.elements.count {
+                        let partGeometry = SCNGeometry(sources: geometry.sources,
+                                                       elements: [geometry.element(at: index)])
+                        let isWrap = index > 0
+                        partGeometry.materials = [isWrap ? ribbon : paper]
+                        if isWrap { partGeometry.subdivisionLevel = 1 }
+                        let part = SCNNode(geometry: partGeometry)
+                        part.name = isWrap ? "wrapping_\(index)" : "paper_box"
+                        part.castsShadow = true; node.addChildNode(part)
+                        if isWrap { wrappingNodes.append(part) } else { boxNodes.append(part) }
+                    }
+                    return
+                }
+                let isWrap = lower.contains("bow") || lower.contains("ribbon")
+                geometry.materials = [isWrap ? ribbon : paper]; node.castsShadow = true
+                if isWrap { wrappingNodes.append(node) } else { boxNodes.append(node) }
+            }
+            node.childNodes.forEach(prepare)
         }
-        let knot = SCNSphere(radius: 5.2); knot.materials = [gold]
-        let knotNode = SCNNode(geometry: knot); knotNode.position.y = 14; lid.addChildNode(knotNode)
-        giftRoot.addChildNode(lid)
-        giftRoot.eulerAngles = SCNVector3(-0.12, -0.42, 0)
+        prepare(modelRoot)
+        let bounds = modelRoot.boundingBox
+        let center = SCNVector3((bounds.min.x + bounds.max.x) * 0.5,
+                                (bounds.min.y + bounds.max.y) * 0.5,
+                                (bounds.min.z + bounds.max.z) * 0.5)
+        modelRoot.pivot = SCNMatrix4MakeTranslation(center.x, center.y, center.z)
+        let extent = max(bounds.max.x - bounds.min.x,
+                         max(bounds.max.y - bounds.min.y, bounds.max.z - bounds.min.z))
+        let scale = 108 / max(extent, 0.001)
+        modelRoot.scale = SCNVector3(scale, scale, scale)
+        giftRoot.addChildNode(modelRoot)
+        giftRoot.position.y = -7
+        giftRoot.eulerAngles = SCNVector3(-0.10, -0.48, 0.035)
         scene.rootNode.addChildNode(giftRoot)
+
+        let shadow = SCNPlane(width: 192, height: 116)
+        let shadowMaterial = SCNMaterial()
+        shadowMaterial.lightingModel = .constant
+        shadowMaterial.diffuse.contents = Self.softShadowTexture()
+        shadowMaterial.isDoubleSided = true
+        shadowMaterial.writesToDepthBuffer = false
+        shadow.materials = [shadowMaterial]
+        let shadowNode = SCNNode(geometry: shadow)
+        shadowNode.eulerAngles.x = -.pi / 2; shadowNode.position = SCNVector3(0, -78, 5)
+        scene.rootNode.addChildNode(shadowNode)
 
         let camera = SCNCamera(); camera.fieldOfView = 34; camera.zNear = 1; camera.zFar = 800
         let cameraNode = SCNNode(); cameraNode.camera = camera
-        cameraNode.position = SCNVector3(145, 105, 205)
+        cameraNode.position = SCNVector3(118, 92, 295)
         let look = SCNLookAtConstraint(target: giftRoot); look.isGimbalLockEnabled = true
         cameraNode.constraints = [look]; scene.rootNode.addChildNode(cameraNode)
 
-        let key = SCNLight(); key.type = .area; key.intensity = 1050
-        key.color = NSColor(calibratedRed: 1, green: 0.84, blue: 0.62, alpha: 1)
-        key.areaExtents = SIMD3<Float>(110, 110, 0); key.castsShadow = true; key.shadowRadius = 8
-        let keyNode = SCNNode(); keyNode.light = key; keyNode.position = SCNVector3(-90, 130, 150)
+        scene.lightingEnvironment.contents = NSColor.white
+        scene.lightingEnvironment.intensity = 0.58
+        let key = SCNLight(); key.type = .area; key.intensity = 1540
+        key.color = NSColor(calibratedRed: 1, green: 0.79, blue: 0.58, alpha: 1)
+        key.areaExtents = SIMD3<Float>(105, 105, 0); key.castsShadow = true; key.shadowRadius = 11
+        let keyNode = SCNNode(); keyNode.light = key; keyNode.position = SCNVector3(-105, 150, 175)
         keyNode.constraints = [SCNLookAtConstraint(target: giftRoot)]; scene.rootNode.addChildNode(keyNode)
-        let fill = SCNLight(); fill.type = .ambient; fill.intensity = 380
+        let rim = SCNLight(); rim.type = .omni; rim.intensity = 680
+        rim.color = NSColor(calibratedRed: 0.40, green: 0.58, blue: 0.92, alpha: 1)
+        let rimNode = SCNNode(); rimNode.light = rim; rimNode.position = SCNVector3(110, 35, -80)
+        scene.rootNode.addChildNode(rimNode)
+        let fill = SCNLight(); fill.type = .ambient; fill.intensity = 480
         let fillNode = SCNNode(); fillNode.light = fill; scene.rootNode.addChildNode(fillNode)
 
-        let turn = SCNAction.sequence([.rotateBy(x: 0, y: 0.10, z: 0, duration: 1.7),
-                                       .rotateBy(x: 0, y: -0.20, z: 0, duration: 3.4),
-                                       .rotateBy(x: 0, y: 0.10, z: 0, duration: 1.7)])
+        let turn = SCNAction.sequence([.rotateBy(x: 0, y: 0.075, z: 0.006, duration: 1.8),
+                                       .rotateBy(x: 0, y: -0.15, z: -0.012, duration: 3.6),
+                                       .rotateBy(x: 0, y: 0.075, z: 0.006, duration: 1.8)])
         turn.timingMode = .easeInEaseOut
         giftRoot.runAction(.repeatForever(turn), forKey: "idle")
+    }
+
+    private static func softShadowTexture() -> NSImage {
+        let size = NSSize(width: 256, height: 128)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        NSGraphicsContext.current?.imageInterpolation = .high
+        let oval = NSBezierPath(ovalIn: NSRect(x: 8, y: 16, width: 240, height: 96))
+        oval.addClip()
+        let gradient = NSGradient(starting: NSColor(calibratedWhite: 0.05, alpha: 0.20),
+                                  ending: NSColor(calibratedWhite: 0.05, alpha: 0))
+        gradient?.draw(in: NSRect(origin: .zero, size: size), relativeCenterPosition: .zero)
+        image.unlockFocus()
+        return image
     }
 
     override func mouseDown(with event: NSEvent) { openGift() }
@@ -315,13 +421,34 @@ final class GiftBox3DView: SCNView {
         guard !opened else { return }
         opened = true
         giftRoot.removeAction(forKey: "idle")
-        let lift = SCNAction.group([.moveBy(x: 0, y: 58, z: -26, duration: 0.72),
-                                    .rotateBy(x: -0.72, y: 0.18, z: 0.12, duration: 0.72)])
-        lift.timingMode = .easeInEaseOut
-        lid.runAction(lift)
-        giftRoot.runAction(.sequence([.scale(to: 1.04, duration: 0.10),
-                                      .scale(to: 0.98, duration: 0.12),
-                                      .scale(to: 1.0, duration: 0.16)]))
+        for (index, node) in wrappingNodes.enumerated() {
+            let direction: CGFloat = index.isMultiple(of: 2) ? -1 : 1
+            let unwrap = SCNAction.group([
+                .moveBy(x: direction * (38 + CGFloat(index) * 8), y: 74, z: 12, duration: 0.76),
+                .rotateBy(x: -0.38, y: direction * 0.7, z: direction * 0.52, duration: 0.76),
+                .fadeOut(duration: 0.64)
+            ])
+            unwrap.timingMode = .easeInEaseOut; node.runAction(unwrap)
+        }
+        for node in boxNodes {
+            let open = SCNAction.sequence([
+                .wait(duration: 0.12),
+                .group([.moveBy(x: 0, y: -22, z: 8, duration: 0.58),
+                        .scale(to: 0.80, duration: 0.58),
+                        .fadeOut(duration: 0.58)])
+            ])
+            open.timingMode = .easeInEaseOut; node.runAction(open)
+        }
+        let glowMaterial = SCNMaterial(); glowMaterial.lightingModel = .constant
+        glowMaterial.emission.contents = NSColor(calibratedRed: 0.30, green: 0.78, blue: 1, alpha: 1)
+        glowMaterial.diffuse.contents = NSColor.clear
+        let glow = SCNNode(geometry: SCNSphere(radius: 7)); glow.geometry?.materials = [glowMaterial]
+        glow.opacity = 0; glow.position.y = -4; giftRoot.addChildNode(glow)
+        glow.runAction(.sequence([.group([.fadeOpacity(to: 0.75, duration: 0.16),
+                                         .scale(to: 3.6, duration: 0.58)]),
+                                  .fadeOut(duration: 0.20)]))
+        giftRoot.runAction(.sequence([.scale(to: 1.035, duration: 0.09),
+                                      .scale(to: 0.99, duration: 0.14)]))
         onOpen?()
     }
 }
@@ -335,10 +462,10 @@ final class GiftWindowController: NSWindowController {
     private let bodyLabel = NSTextField(wrappingLabelWithString: "")
     private let giftName = NSTextField(labelWithString: "")
     private let openButton = NSButton(title: "", target: nil, action: nil)
-    private let armButton = NSButton(title: "", target: nil, action: nil)
     private let languageButton = NSButton(title: "中 / EN", target: nil, action: nil)
     private let swatter = SwatterGraphicView(frame: .zero)
     private let giftBox = GiftBox3DView(frame: .zero)
+    private var swatterCenterY: NSLayoutConstraint!
     private var opened = false
 
     init() {
@@ -373,20 +500,20 @@ final class GiftWindowController: NSWindowController {
         giftName.alignment = .center
         giftName.isHidden = true
         swatter.isHidden = true
+        swatter.onClick = { [weak self] in self?.arm() }
+        swatter.toolTip = language == .zh ? "点击拿起苍蝇拍" : "Click to pick up the swatter"
         giftBox.onOpen = { [weak self] in self?.openGift() }
         openButton.bezelStyle = .rounded
         openButton.target = self; openButton.action = #selector(openGift)
-        armButton.bezelStyle = .rounded
-        armButton.target = self; armButton.action = #selector(arm)
-        armButton.isHidden = true
         languageButton.isBordered = false
         languageButton.font = .boldSystemFont(ofSize: 12)
         languageButton.contentTintColor = giftRed
         languageButton.target = self; languageButton.action = #selector(toggleLanguage)
 
-        for v in [titleLabel, bodyLabel, giftName, giftBox, swatter, openButton, armButton, languageButton] {
+        for v in [titleLabel, bodyLabel, giftName, giftBox, swatter, openButton, languageButton] {
             v.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(v)
         }
+        swatterCenterY = swatter.centerYAnchor.constraint(equalTo: root.centerYAnchor, constant: 34)
         NSLayoutConstraint.activate([
             languageButton.topAnchor.constraint(equalTo: root.topAnchor, constant: 24),
             languageButton.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
@@ -404,15 +531,12 @@ final class GiftWindowController: NSWindowController {
             giftBox.widthAnchor.constraint(equalToConstant: 330),
             giftBox.heightAnchor.constraint(equalToConstant: 245),
             swatter.centerXAnchor.constraint(equalTo: root.centerXAnchor),
-            swatter.topAnchor.constraint(equalTo: giftName.bottomAnchor, constant: 3),
-            swatter.widthAnchor.constraint(equalToConstant: 118),
-            swatter.heightAnchor.constraint(equalToConstant: 150),
+            swatterCenterY,
+            swatter.widthAnchor.constraint(equalToConstant: 150),
+            swatter.heightAnchor.constraint(equalToConstant: 205),
             openButton.centerXAnchor.constraint(equalTo: root.centerXAnchor),
             openButton.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -35),
             openButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 155),
-            armButton.centerXAnchor.constraint(equalTo: root.centerXAnchor),
-            armButton.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -38),
-            armButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 235),
         ])
         updateCopy()
     }
@@ -431,7 +555,7 @@ final class GiftWindowController: NSWindowController {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.74) { [weak self] in
             guard let self else { return }
             self.giftBox.isHidden = true
-            self.giftName.isHidden = false; self.swatter.isHidden = false; self.armButton.isHidden = false
+            self.giftName.isHidden = false; self.swatter.isHidden = false
             self.updateCopy()
         }
     }
@@ -447,15 +571,15 @@ final class GiftWindowController: NSWindowController {
         bodyLabel.stringValue = c.giftBody
         openButton.title = c.open
         giftName.stringValue = c.swatter
-        armButton.title = c.arm
+        swatter.toolTip = c.arm
     }
 
     func collapseToTray(on screen: NSScreen) {
         guard let window else { return }
         titleLabel.isHidden = true; bodyLabel.isHidden = true; giftName.isHidden = true
-        swatter.isHidden = true; openButton.isHidden = true; languageButton.isHidden = true
-        armButton.isHidden = false; armButton.title = GiftCopy(language: language).tray
-        let size = NSSize(width: 245, height: 94)
+        swatter.isHidden = false; openButton.isHidden = true; languageButton.isHidden = true
+        swatterCenterY.constant = 0
+        let size = NSSize(width: 180, height: 220)
         let f = screen.visibleFrame
         window.setFrame(NSRect(x: f.maxX - size.width - 22, y: f.minY + 22, width: size.width, height: size.height), display: true, animate: true)
     }
@@ -465,7 +589,9 @@ final class SwatterOverlayController {
     private let panel: NSPanel
     private let graphic: SwatterGraphicView
     private(set) var armed = false
+    private(set) var isSwinging = false
     private var animationTimer: Timer?
+    private var swingPhase: CGFloat = 0
 
     init() {
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 105, height: 135), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
@@ -491,17 +617,40 @@ final class SwatterOverlayController {
     func swing() {
         guard armed else { return }
         animationTimer?.invalidate()
+        isSwinging = true
         let start = ProcessInfo.processInfo.systemUptime
         animationTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] timer in
             guard let self else { timer.invalidate(); return }
             let t = (ProcessInfo.processInfo.systemUptime - start) / 0.22
-            if t >= 1 { self.graphic.swing = 0; timer.invalidate(); return }
-            self.graphic.swing = CGFloat(sin(t * .pi))
+            if t >= 1 {
+                self.isSwinging = false
+                self.swingPhase = 0; self.graphic.swing = 0; timer.invalidate(); return
+            }
+            self.swingPhase = CGFloat(sin(t * .pi))
+            self.graphic.swing = self.swingPhase
         }
+    }
+
+    /// Geometric counterpart of the rendered plastic head. The pointer sits
+    /// near the upper handle/head junction; rotating this offset around the
+    /// same pivot as `SwatterGraphicView` keeps perception and hit testing
+    /// aligned with the pixels during a swing.
+    func headSample(at pointer: CGPoint) -> SwatterHeadSample? {
+        guard armed else { return nil }
+        let angle = (-10 - swingPhase * 34) * .pi / 180
+        let pivot = CGPoint(x: pointer.x, y: pointer.y - 105)
+        let headVector = CGPoint(x: 0, y: 92)
+        let c = cos(angle), s = sin(angle)
+        let center = CGPoint(x: pivot.x + headVector.x * c - headVector.y * s,
+                             y: pivot.y + headVector.x * s + headVector.y * c)
+        return SwatterHeadSample(center: center, size: CGSize(width: 72, height: 54),
+                                 angle: angle, swing: swingPhase)
     }
 
     func disarm() {
         animationTimer?.invalidate(); animationTimer = nil
+        isSwinging = false
+        swingPhase = 0; graphic.swing = 0
         panel.orderOut(nil)
         guard armed else { return }
         armed = false
@@ -565,25 +714,125 @@ final class CountdownWindowController {
 final class SplatWindowController {
     private let panel: NSPanel
     init(at point: CGPoint) {
-        panel = NSPanel(contentRect: NSRect(x: point.x - 50, y: point.y - 40, width: 100, height: 80), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        let size = NSSize(width: 240, height: 190)
+        panel = NSPanel(contentRect: NSRect(x: point.x - size.width / 2,
+                                            y: point.y - size.height / 2,
+                                            width: size.width, height: size.height),
+                        styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = false
         panel.ignoresMouseEvents = true; panel.level = .screenSaver
-        let v = SplatView(frame: NSRect(x: 0, y: 0, width: 100, height: 80)); panel.contentView = v
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        let v = SplatView(frame: NSRect(origin: .zero, size: size)); panel.contentView = v
         panel.orderFrontRegardless()
+        v.beginDissolve()
     }
     func hide() { panel.orderOut(nil) }
 }
 
 private final class SplatView: NSView {
-    override func draw(_ dirtyRect: NSRect) {
-        let dark = NSColor(calibratedRed: 0.16, green: 0.08, blue: 0.035, alpha: 0.82)
-        dark.setFill()
-        NSBezierPath(ovalIn: NSRect(x: 22, y: 22, width: 58, height: 34)).fill()
-        for i in 0..<13 {
-            let a = CGFloat(i) / 13 * .pi * 2
-            let r: CGFloat = i % 3 == 0 ? 42 : 34
-            let p = NSPoint(x: 50 + cos(a) * r, y: 40 + sin(a) * r * 0.65)
-            NSBezierPath(ovalIn: NSRect(x: p.x - 3, y: p.y - 2, width: 6, height: 4)).fill()
+    private let residueLayer = CALayer()
+    private let emitter = CAEmitterLayer()
+    private let scanRing = CAShapeLayer()
+    private var started = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer = CALayer()
+        layer?.masksToBounds = false
+        configureLayers()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    private func configureLayers() {
+        guard let root = layer else { return }
+        residueLayer.frame = bounds.insetBy(dx: 22, dy: 28)
+        residueLayer.contentsGravity = .resizeAspect
+        residueLayer.opacity = 0
+        if let url = findResource("splat-realistic-v1.png")
+                ?? findResource("assets/splat-realistic-v1.png"),
+           let image = NSImage(contentsOf: url) {
+            var rect = NSRect(origin: .zero, size: image.size)
+            residueLayer.contents = image.cgImage(forProposedRect: &rect, context: nil, hints: nil)
+        }
+        root.addSublayer(residueLayer)
+
+        scanRing.frame = bounds
+        scanRing.path = CGPath(ellipseIn: bounds.insetBy(dx: 67, dy: 45), transform: nil)
+        scanRing.fillColor = NSColor.clear.cgColor
+        scanRing.strokeColor = NSColor(calibratedRed: 0.20, green: 0.84, blue: 1, alpha: 0.88).cgColor
+        scanRing.lineWidth = 1.35; scanRing.lineDashPattern = [3, 5]
+        scanRing.shadowColor = NSColor(calibratedRed: 0.12, green: 0.76, blue: 1, alpha: 1).cgColor
+        scanRing.shadowRadius = 7; scanRing.shadowOpacity = 0.9; scanRing.opacity = 0
+        root.addSublayer(scanRing)
+
+        emitter.frame = bounds; emitter.emitterPosition = CGPoint(x: bounds.midX, y: bounds.midY)
+        emitter.emitterShape = .point; emitter.renderMode = .additive
+        emitter.birthRate = 0
+        let blue = particleCell(color: NSColor(calibratedRed: 0.20, green: 0.86, blue: 1, alpha: 1),
+                                velocity: 76, scale: 0.65)
+        let gold = particleCell(color: NSColor(calibratedRed: 1, green: 0.69, blue: 0.20, alpha: 1),
+                                velocity: 58, scale: 0.46)
+        emitter.emitterCells = [blue, gold]
+        root.addSublayer(emitter)
+    }
+
+    private func particleCell(color: NSColor, velocity: CGFloat, scale: CGFloat) -> CAEmitterCell {
+        let cell = CAEmitterCell()
+        cell.contents = particleImage(color: color)
+        cell.birthRate = 92; cell.lifetime = 0.82; cell.lifetimeRange = 0.28
+        cell.velocity = velocity; cell.velocityRange = 46
+        cell.emissionRange = .pi * 2
+        cell.scale = scale; cell.scaleRange = 0.34; cell.scaleSpeed = -0.28
+        cell.alphaSpeed = -1.08; cell.spinRange = .pi * 2
+        cell.color = color.cgColor
+        return cell
+    }
+
+    private func particleImage(color: NSColor) -> CGImage? {
+        let image = NSImage(size: NSSize(width: 13, height: 13))
+        image.lockFocus()
+        let shadow = NSShadow(); shadow.shadowColor = color; shadow.shadowBlurRadius = 4
+        shadow.shadowOffset = .zero; shadow.set()
+        color.setFill(); NSBezierPath(roundedRect: NSRect(x: 4, y: 4, width: 5, height: 5),
+                                      xRadius: 1.2, yRadius: 1.2).fill()
+        image.unlockFocus()
+        var rect = NSRect(origin: .zero, size: image.size)
+        return image.cgImage(forProposedRect: &rect, context: nil, hints: nil)
+    }
+
+    func beginDissolve() {
+        guard !started else { return }
+        started = true
+        let appear = CAKeyframeAnimation(keyPath: "transform.scale")
+        appear.values = [0.72, 1.08, 1.0]; appear.keyTimes = [0, 0.62, 1]
+        appear.duration = 0.18; appear.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        residueLayer.add(appear, forKey: "impact")
+        residueLayer.opacity = 1
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.48) { [weak self] in
+            guard let self else { return }
+            self.emitter.birthRate = 1
+            self.scanRing.opacity = 1
+            let ring = CAAnimationGroup()
+            let scale = CABasicAnimation(keyPath: "transform.scale")
+            scale.fromValue = 0.38; scale.toValue = 1.65
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = 0.9; fade.toValue = 0
+            ring.animations = [scale, fade]; ring.duration = 0.72
+            ring.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            self.scanRing.add(ring, forKey: "scan")
+            self.scanRing.opacity = 0
+
+            CATransaction.begin(); CATransaction.setAnimationDuration(0.82)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeInEaseOut))
+            self.residueLayer.opacity = 0
+            self.residueLayer.transform = CATransform3DMakeScale(0.64, 0.64, 1)
+            CATransaction.commit()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) { [weak self] in
+                self?.emitter.birthRate = 0
+            }
         }
     }
 }
@@ -740,6 +989,23 @@ func runGameTest() {
           flyHitTest(cursor: CGPoint(x: 29.5, y: 0), center: .zero, visualRadius: 22))
     check("hit test still rejects clear misses",
           !flyHitTest(cursor: CGPoint(x: 31, y: 0), center: .zero, visualRadius: 22))
+    let head = SwatterHeadSample(center: .zero, size: CGSize(width: 72, height: 54),
+                                 angle: -.pi / 4, swing: 0.8)
+    check("swatter uses the rendered head area, not only the pointer",
+          swatterHeadHitTest(flyCenter: CGPoint(x: 29, y: -29), flyRadius: 10, head: head))
+    check("swatter head rejects a clear geometric miss",
+          !swatterHeadHitTest(flyCenter: CGPoint(x: 95, y: 95), flyRadius: 10, head: head))
+    let sweepStart = SwatterHeadSample(center: CGPoint(x: -90, y: 0),
+                                       size: CGSize(width: 72, height: 54),
+                                       angle: 0, swing: 0)
+    let sweepEnd = SwatterHeadSample(center: CGPoint(x: 90, y: 0),
+                                     size: CGSize(width: 72, height: 54),
+                                     angle: -.pi / 3, swing: 1)
+    check("swept hit catches a fly between animation frames",
+          !swatterHeadHitTest(flyCenter: .zero, flyRadius: 10, head: sweepStart)
+          && !swatterHeadHitTest(flyCenter: .zero, flyRadius: 10, head: sweepEnd)
+          && sweptSwatterHeadHitTest(flyCenter: .zero, flyRadius: 10,
+                                     from: sweepStart, to: sweepEnd))
     if failures > 0 { fputs("\(failures) GAME TEST FAILURES\n", stderr); exit(1) }
     print("GAME TEST PASS")
 }
